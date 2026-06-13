@@ -6,6 +6,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.x](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/)
+[![Latest Release](https://img.shields.io/github/v/release/MeXenon/kiro-session-export?label=release)](https://github.com/MeXenon/kiro-session-export/releases/latest)
 
 Terminal-native Markdown export for **Kiro IDE** and **Kiro CLI** sessions.
 
@@ -70,19 +71,19 @@ Download and run the script with Python.
 Linux / macOS:
 
 ```bash
-curl -sO https://raw.githubusercontent.com/<owner>/<repo>/main/kiro-md.py && python3 kiro-md.py
+curl -sO https://raw.githubusercontent.com/MeXenon/kiro-session-export/main/kiro-md.py && python3 kiro-md.py
 ```
 
 Windows Command Prompt:
 
 ```cmd
-curl -sO https://raw.githubusercontent.com/<owner>/<repo>/main/kiro-md.py && python kiro-md.py
+curl -sO https://raw.githubusercontent.com/MeXenon/kiro-session-export/main/kiro-md.py && python kiro-md.py
 ```
 
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/<owner>/<repo>/main/kiro-md.py" -OutFile "kiro-md.py"; python .\kiro-md.py
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/MeXenon/kiro-session-export/main/kiro-md.py" -OutFile "kiro-md.py"; python .\kiro-md.py
 ```
 
 Manual run after cloning:
@@ -308,7 +309,7 @@ Expected matches should only be generic examples or platform storage references.
 
 ## Release Notes
 
-### v1.2.0
+### [v1.2.0](https://github.com/MeXenon/kiro-session-export/releases/tag/v1.2.0)
 
 - Added Kiro CLI session browsing.
 - Added detailed Kiro CLI `.jsonl` event-stream parsing.
