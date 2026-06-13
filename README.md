@@ -2,185 +2,360 @@
   <img src="banner.png" alt="Kiro Session Export Preview" width="100%" style="max-width: 800px; border-radius: 12px; margin-bottom: 20px;">
 </div>
 
-# Kiro Session & Conversation Export ⚡️
+# Kiro Session & Conversation Export
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.x](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/)
-[![Visitors](https://komarev.com/ghpvc/?username=mexenon-kirosessionexport&label=visitors&color=1d70b8&style=flat)](https://github.com/MeXenon/kiro-session-export)
 
-**The ultimate, terminal-native export pipeline for Kiro IDE sessions.**
+Terminal-native Markdown export for **Kiro IDE** and **Kiro CLI** sessions.
 
-If you find this tool useful, **please consider leaving a ⭐️ on this repository!** It helps others find the project.
-
----
-
-## 🛑 The Problem
-
-Kiro currently has **no built-in way to copy, export, or review your conversations and sessions.** You can't even copy your own messages out of the chat panel.
-
-On top of that, when your context window fills up, Kiro silently **compacts the conversation into a summary and moves to a new session** — you have zero control over this process. For heavy-duty, multi-step workflows this means:
-
-- **You lose access to earlier context.** Once compaction fires, the original conversation is gone from the active window. There's no "scroll up" to find what happened 50 turns ago.
-- **You can't feed sessions into another AI** for debugging, code review, or analysis.
-- **You can't extract terminal commands** to create automated scripts from what the agent ran.
-- **You can't read the agent's hidden reasoning,** sub-agent calls, or internal decision traces.
-- **You can't trace the full lineage** of a conversation that was split across multiple compacted sessions.
-
-The raw session data *does* exist on disk, but it's buried across dozens of JSON files in deeply nested storage directories, making it essentially impossible to read manually.
-
-## 💡 The Solution
-
-**Kiro Session Manager** (`kiro-md.py`) is designed for maximum flexibility. It parses Kiro's local session storage — including workspace session indices, shell histories, and execution records — and provides a beautiful, interactive, fullscreen terminal UI (TUI) to dynamically filter exactly what you want to export into clean Markdown.
-
-Because it's a pure Python CLI tool, it's completely **portable**. You can use it locally on your laptop, or run it headlessly on a remote machine. It is 100% compatible with Kiro IDE on Windows, macOS, and Linux.
+`kiro-md.py` lets you browse local Kiro conversations, filter exactly which
+sections to keep, and export clean Markdown files for review, debugging,
+handoff, audits, or feeding another model.
 
 ---
 
-## ✨ Features
+## What It Solves
 
-- **21 Filterable Sections:** Toggle everything from User/Agent messages to hidden agent reasoning, terminal commands, MCP tool calls, sub-agent invocations, web searches, diagnostics, and more.
-- **Compaction Chain Tracking:** Automatically detects and links sessions that flowed from each other via context compaction. View sessions in chain-grouped mode with authoritative `parentSessionIds` ancestry and heuristic fallback linking.
-- **Parallel Exports:** Select and process multiple sessions at the same time. The filter shows combined line counts and exports them simultaneously.
-- **Dynamic Output Capping:** Terminal payloads can be hundreds of thousands of lines long. Instantly cap output blocks to exactly 1, 5, 8, 10, or up to 500 lines to keep your context windows lean.
-- **Granular Message Filtering:** Independently control how many of the last N blocks you want from each message type — 👤 User, 🤖 Agent, 🧠 Reasoning, and ✂️ Compaction Summary — all separately adjustable with `◀`/`▶`.
-- **Last N Turns:** Don't need the full session? Select only the most recent N turns to export. A "turn" is one user message plus all the agent work that followed.
-- **Live Context:** Want to see *exactly* what the LLM was seeing? The "Live Context" option replicates Kiro's own compaction logic — every summarization block clears prior items, giving you the strict active memory window.
-- **"Clean Chat" Mode:** Instantly strips messy IDE background data, active-file streams, and open-tab XML that Kiro silently attaches to prompts, leaving just your actual words.
-- **7 Built-in Presets:** Jump straight to "Chat Only", "Chat + Reasoning", "Chat + Terminal", "Code Activity", "Outputs Only", or "Full Export" with a single keystroke.
-- **Real-Time Context Math:** See exactly how many lines you are selecting *before* you export, complete with a live progress bar.
-- **Chain Merge Export:** Export an entire compaction chain as one unified Markdown document, with session dividers and lineage annotations.
-- **Multi-Workspace Support:** Automatically detects all Kiro workspaces, with smart cwd-based auto-selection and one-keystroke workspace switching.
-- **Execution Record Indexing:** Indexes every execution record under `KIRO_HOME` using parallel IO and single-pass regex extraction — no full JSON parse needed for metadata.
+Kiro sessions can be difficult to review outside the app:
+
+- Kiro IDE stores session shell files and execution records in separate places.
+- Kiro CLI stores a compact `.json` index plus a detailed `.jsonl` event stream.
+- Tool calls, file edits, shell commands, MCP calls, web activity, reasoning, and
+  compaction summaries are not convenient to read manually.
+- Long sessions can contain huge terminal outputs or file reads that need
+  trimming before they are useful in another context window.
+
+This tool reads those local storage formats and renders a structured Markdown
+export with interactive controls.
 
 ---
 
-## 🛠 Usage
+## Highlights
 
-No complex dependencies. Just download and run the script using Python.
+- **Kiro IDE and Kiro CLI support:** choose the source at startup.
+- **Full Kiro CLI JSONL parsing:** exports real prompts, assistant messages,
+  reasoning, file reads, file creates, file edits, terminal commands, terminal
+  outputs, grep/glob/code searches, MCP calls, sub-agent/task calls, web search,
+  web fetch, errors, events, and compaction summaries.
+- **IDE execution-record joining:** maps Kiro IDE shell histories to execution
+  records so tool activity appears in the right Markdown sections.
+- **Session ID finder:** search both IDE and CLI stores in parallel by full
+  session ID or prefix. If a match exists on both sides, the tool asks which one
+  to export.
+- **Workspace-aware browsing:** sessions are grouped by workspace/project
+  directory. Running from inside a workspace auto-selects that workspace.
+- **CLI helper-session toggle:** Kiro CLI can create many subagent/helper
+  sessions. They are hidden by default and can be shown with `e`.
+- **Selectable export destination:** save to file, clipboard, or both.
+- **Save-location prompt:** when writing files, choose the project directory or
+  the script directory. If both are the same, no prompt is shown.
+- **Multi-session export:** export selected sessions separately or merge them
+  into one combined Markdown file.
+- **Chain merge export for IDE:** export detected compaction chains as one
+  unified document with lineage annotations.
+- **Interactive section filter:** toggle 22 sections, apply presets, and cap
+  large outputs before writing.
+- **Live-context mode for IDE:** reproduce Kiro IDE's compaction behavior by
+  keeping only the active context after summarization.
+- **Zero required dependencies:** uses Python standard library by default.
+  Optional `orjson` speeds up large JSON parsing.
 
-### 🚀 Quick Start (One-Liner)
-Run the software instantly without manually cloning the repo:
+---
 
-**🐧 Linux / 🍎 macOS:**
+## Quick Start
+
+Download and run the script with Python.
+
+Linux / macOS:
+
 ```bash
-curl -sO https://raw.githubusercontent.com/MeXenon/kiro-session-export/main/kiro-md.py && python3 kiro-md.py
+curl -sO https://raw.githubusercontent.com/<owner>/<repo>/main/kiro-md.py && python3 kiro-md.py
 ```
 
-**🪟 Windows — Command Prompt:**
+Windows Command Prompt:
+
 ```cmd
-curl -sO https://raw.githubusercontent.com/MeXenon/kiro-session-export/main/kiro-md.py && python kiro-md.py
+curl -sO https://raw.githubusercontent.com/<owner>/<repo>/main/kiro-md.py && python kiro-md.py
 ```
 
-**🪟 Windows — PowerShell 7:**
+Windows PowerShell:
+
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/MeXenon/kiro-session-export/main/kiro-md.py" -OutFile "kiro-md.py"; python kiro-md.py
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/<owner>/<repo>/main/kiro-md.py" -OutFile "kiro-md.py"; python .\kiro-md.py
 ```
 
-### 💻 Manual Run
-If you prefer to download or clone the file manually:
+Manual run after cloning:
 
-**Linux / macOS:**
 ```bash
-python3 kiro-md.py
-```
-
-**Windows:**
-```cmd
 python kiro-md.py
 ```
 
-> **Tip:** For faster JSON parsing on large sessions, install `orjson` (`pip install orjson`). The script auto-detects it and falls back to stdlib `json` seamlessly.
+For faster parsing on very large sessions:
 
-### The Interface
+```bash
+pip install orjson
+```
 
-1. **Select a workspace:** The script automatically scans Kiro's `globalStorage` and presents your workspaces sorted by recent activity. It auto-selects the workspace matching your current working directory.
-2. **Browse sessions:** A rich table view shows every session with date, title, compaction chain membership, badges (↻ from compaction, ↪ continued, hidden), preview text, and file size.
-3. **Choose extraction scope:**
-   * **[F] Full Session** — Export all turns (default).
-   * **[L] Last N Turns** — Enter a number and only the most recent N turns are included.
-   * **[C] Live Context** — Replicates Kiro's compaction logic to extract the strict active context window.
-4. **Filter & Refine:** 
-   * `↑` / `↓` - Navigate the filter list
-   * `Enter` / `Space` - Toggle a section ON/OFF
-   * `◀` / `▶` on **📤 Terminal Output Cap** - Adjust max lines per output block
-   * `◀` / `▶` on **👤 User Message Cap** - Keep only the last N user messages
-   * `◀` / `▶` on **🤖 Agent Message Cap** - Keep only the last N agent responses
-   * `◀` / `▶` on **🧠 Reasoning Cap** - Keep only the last N reasoning blocks
-   * `◀` / `▶` on **✂️ Compaction Summary Cap** - Keep only the last N summaries
-   * `1`-`7` - Load presets
-5. **Export Destination:** Press `Q` when you're ready:
-   * **[F]ile:** Save directly to a `.md` file in the current directory (Default).
-   * **[C]lipboard:** Instantly copy the raw Markdown so you can paste it straight into ChatGPT or Claude.
-   * **[B]oth:** Save to disk *and* copy to clipboard simultaneously.
+The script automatically uses `orjson` when available and falls back to
+standard `json` when it is not.
 
 ---
 
-## 📂 Kiro Storage Layout
+## Running From Any Workspace
 
-For reference, this is the internal storage structure that `kiro-md.py` navigates:
+You can run the script by absolute path from any project directory. This lets the
+tool detect the workspace you are currently inside:
 
+```powershell
+python "C:\path\to\kiro-md.py"
 ```
+
+No project path is hardcoded in the tool. It uses your current working directory
+and Kiro's local storage paths.
+
+---
+
+## Startup Menu
+
+At launch, choose the data source:
+
+```text
+[1] Kiro IDE sessions
+[2] Kiro CLI sessions
+[3] Find by session ID
+```
+
+### Kiro IDE Sessions
+
+Scans Kiro IDE workspace session indexes and execution records. IDE mode
+supports workspace browsing, hidden-session toggle, chain view, and full chain
+merge export.
+
+### Kiro CLI Sessions
+
+Scans Kiro CLI session files. CLI mode uses `.json` files for metadata and
+prefers the matching `.jsonl` event stream for the actual transcript. This is
+what makes file edits, terminal output, MCP calls, subagent calls, and
+compactions appear correctly.
+
+### Find By Session ID
+
+Searches Kiro IDE and Kiro CLI stores in parallel. You can paste a full session
+ID or a useful prefix. Exact matches win. If a prefix matches multiple sessions,
+the tool lists them and asks which one to use.
+
+---
+
+## Interface Flow
+
+1. **Choose source:** IDE, CLI, or Find by session ID.
+2. **Browse workspaces:** workspaces are sorted by recent activity. The current
+   workspace is highlighted when detected.
+3. **Select sessions:** type IDs like `1`, `1, 3`, or `a` for all listed.
+4. **Choose scope:** full session, last N turns, or live context when available.
+5. **Filter sections:** use the fullscreen filter UI to choose what to export.
+6. **Choose destination:** file, clipboard, or both.
+7. **Choose save folder:** project directory or script directory when they differ.
+
+Useful browsing keys:
+
+| Key | Action |
+|-----|--------|
+| `w` | Switch workspace/directory |
+| `w1`, `w2`, ... | Jump directly to a workspace from the summary |
+| `x` | Clear workspace filter and show all workspaces |
+| `m` | Show more rows |
+| `s` | Toggle sort mode |
+| `r` | Reload session index |
+| `e` | CLI only: show/hide helper/subagent sessions |
+| `c` | IDE only: toggle chain-grouped view |
+| `ce <id>` | IDE only: export an entire detected chain |
+| `q` | Quit |
+
+---
+
+## Export Destinations
+
+After filtering, choose where the Markdown goes:
+
+```text
+[F] File
+[C] Clipboard
+[B] Both
+```
+
+When writing files, the tool asks where to save:
+
+```text
+[P] Project directory
+[S] Script directory
+```
+
+If the project directory and script directory are the same, the question is
+skipped. For separate exports across multiple workspaces, `Project directories`
+saves each session next to its own project.
+
+---
+
+## Supported Sections
+
+| Section | Default | Description |
+|---------|---------|-------------|
+| User Messages | On | User prompts and requests |
+| Agent Messages | On | Assistant responses |
+| Agent Reasoning | Off | Thinking/reasoning traces when present in local data |
+| File Reads | Off | Files inspected by the agent |
+| File Creates | On | New files created by the agent |
+| File Edits | On | File modifications |
+| File Deletes | On | Deleted files |
+| Terminal Commands | On | Shell commands requested by the agent |
+| Terminal Outputs | On | Shell command results |
+| Process Control | On | Process/background-control activity |
+| Code Search | Off | Grep/glob/code lookup activity |
+| Diagnostics | Off | IDE diagnostics when available |
+| Web Searches | Off | Web search queries and result links |
+| Web Fetches | Off | Retrieved URL content |
+| MCP Calls | Off | MCP tool calls and responses |
+| Sub-Agent Calls | On | Task/subagent invocations and results |
+| Compaction Summary | On | Context compaction summaries |
+| Intent Classification | Off | Intent classification records |
+| Errors | Off | Error records |
+| Clarifying Q&A | Off | Agent clarification prompts |
+| Session Events | On | Lifecycle and bookkeeping events |
+| Session Metadata | On | Session ID, workspace, model, context, credits, etc. |
+
+---
+
+## Filter Presets And Caps
+
+The filter screen lets you:
+
+- Toggle each section on or off.
+- Load presets such as chat-only, chat plus terminal, code activity, outputs
+  only, or full export.
+- Cap large output blocks to a fixed number of lines.
+- Keep only the last N user messages, agent messages, reasoning blocks, or
+  summaries.
+- Enable clean-chat mode to strip IDE context noise from user prompts.
+
+This is useful when a raw session is too large for a context window.
+
+---
+
+## Storage Layouts
+
+### Kiro IDE
+
+Typical Kiro IDE storage:
+
+```text
 %APPDATA%/Kiro/User/globalStorage/kiro.kiroagent/
-├── workspace-sessions/<urlsafe-b64 workspace-path>/
-│   ├── sessions.json              ← per-workspace session index
-│   └── <sessionId>.json           ← session shell (user msgs + stubs)
-└── <workspace-hash>/<bucket>/<execution-hash>   ← execution records
+├── workspace-sessions/<workspace-id>/
+│   ├── sessions.json
+│   └── <sessionId>.json
+└── <workspace-hash>/<bucket>/<execution-record>
 ```
 
-Execution records hold the actual tool calls, assistant `say` messages, reasoning, summarizations (compaction), errors, and everything else the agent did during a session.
+Override the IDE root with:
+
+```bash
+KIRO_HOME=/custom/path python kiro-md.py
+```
+
+### Kiro CLI
+
+Typical Kiro CLI storage:
+
+```text
+~/.kiro/sessions/cli/
+├── <sessionId>.json
+├── <sessionId>.jsonl
+├── <sessionId>.history
+└── <sessionId>.lock
+```
+
+The `.json` file is compact metadata. The `.jsonl` file is the detailed event
+stream used for rich exports.
+
+Override the CLI session directory with:
+
+```bash
+KIRO_CLI_SESSIONS_DIR=/custom/path python kiro-md.py
+```
 
 ---
 
-## 📦 Supported Sections
+## Privacy And GitHub Safety
 
-| Emoji | Section | Default | Description |
-|-------|---------|---------|-------------|
-| 👤 | User Messages | ✅ | Your prompts and requests |
-| 🤖 | Agent Messages | ✅ | Kiro's responses |
-| 🧠 | Agent Reasoning | ❌ | Internal reasoning traces |
-| 📖 | File Reads | ❌ | Files the agent inspected |
-| 🆕 | File Creates | ✅ | New files created |
-| ✏️ | File Edits | ✅ | Modifications to existing files |
-| 🗑️ | File Deletes | ✅ | Deleted files |
-| 💻 | Terminal Commands | ✅ | Commands executed |
-| 📤 | Terminal Outputs | ✅ | Command results |
-| ⚙️ | Process Control | ✅ | Background processes |
-| 🔎 | Code Search | ❌ | Search queries and results |
-| 🩺 | Diagnostics | ❌ | IDE diagnostics |
-| 🌐 | Web Searches | ❌ | Web search queries |
-| 🔗 | Web Fetches | ❌ | URL content fetches |
-| 🔌 | MCP Calls | ❌ | Model Context Protocol tool calls |
-| 🧩 | Sub-Agent Calls | ✅ | Delegated sub-agent invocations |
-| ✂️ | Compaction Summary | ✅ | Context compaction summaries |
-| 🎯 | Intent Classification | ❌ | Intent detection results |
-| ❗ | Errors | ❌ | Error messages |
-| ❓ | Clarifying Q&A | ❌ | Agent's clarification questions |
-| 🔔 | Session Events | ✅ | Lifecycle events |
-| 📝 | Session Metadata | ✅ | Session configuration details |
+The repository does not need your project paths or user directory to work.
+
+- No local workspace path is hardcoded.
+- No personal home directory is required in the README.
+- The script discovers storage from environment variables and platform defaults.
+- Exported Markdown files are generated locally and are not committed by the
+  tool.
+
+Before publishing, you can scan for accidental local paths:
+
+```bash
+rg -n "C:\\\\Users|/Users/|/home/|Desktop[\\\\/]work|\\.kiro[\\\\/]sessions" .
+```
+
+Expected matches should only be generic examples or platform storage references.
 
 ---
 
-## 📈 Activity & Growth
+## Release Notes
 
-[![Star History Chart](https://api.star-history.com/svg?repos=mexenon/kiro-session-export&type=Date&theme=dark)](https://star-history.com/#mexenon/kiro-session-export&Date)
+### v1.2.0
+
+- Added Kiro CLI session browsing.
+- Added detailed Kiro CLI `.jsonl` event-stream parsing.
+- Added startup source chooser for IDE, CLI, and session-ID search.
+- Added parallel session-ID lookup across IDE and CLI stores.
+- Added CLI helper/subagent session toggle.
+- Added workspace highlighting and current-workspace auto-selection.
+- Added CLI message-count column and real transcript-size display.
+- Added save-location selection between project directory and script directory.
+- Added multi-workspace save behavior for separate exports.
+- Updated CLI exports to include file reads, creates, edits, terminal commands,
+  terminal outputs, MCP calls, web activity, subagent/task calls, compactions,
+  and errors.
+
+### v1.1.x
+
+- Added richer Kiro IDE chain detection and chain merge export.
+- Added interactive filtering, section presets, output caps, and clean-chat mode.
+- Added faster execution-record indexing for Kiro IDE storage.
 
 ---
 
-## 🔗 Related Projects
+## Compatibility
 
-Looking for the same tool but for OpenAI Codex? Check out **[codex-session-export](https://github.com/MeXenon/codex-session-export)**.
+Tested storage families:
+
+- Kiro IDE local desktop storage
+- Kiro CLI local session storage with `.json` plus `.jsonl`
+
+Supported operating systems:
+
+- Windows
+- macOS
+- Linux
+
+The script is read-only against Kiro storage. It writes only the Markdown export
+files you explicitly choose to save.
 
 ---
 
-### Compatibility
+## Related Projects
 
-> **Tested on:** Kiro IDE (desktop application).  
-> **Not tested on:** Kiro CLI. The CLI may use a different storage layout. If you try it and it works (or doesn't), please open an issue!
+Looking for the same idea for OpenAI Codex sessions? Search for
+`codex-session-export`.
 
 ---
 
-### Why build this?
+## License
 
-When pushing AI to its limits, the conversation log becomes your most valuable codebase asset. This tool guarantees you have complete ownership, visibility, and control over that data.
-
-*If this tool saved your context window (or your sanity), **please give it a ⭐️!***
+Apache 2.0. See [LICENSE](LICENSE).

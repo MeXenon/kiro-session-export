@@ -65,6 +65,7 @@ class Style:
     REVERSE = '\033[7m'
     RESET   = '\033[0m'
     BG_GRAY = '\033[48;5;236m'
+    BG_SELECTED = '\033[48;5;238m'
 
     @staticmethod
     def title(msg): return f"{Style.BOLD}{Style.HEADER}{msg}{Style.RESET}"
@@ -104,8 +105,16 @@ def default_kiro_home() -> Path:
     # Linux
     return Path.home() / ".config" / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
 
+def default_kiro_cli_sessions_dir() -> Path:
+    """Locate Kiro CLI's local session JSON directory."""
+    env = os.environ.get("KIRO_CLI_SESSIONS_DIR")
+    if env:
+        return Path(env)
+    return Path.home() / ".kiro" / "sessions" / "cli"
+
 KIRO_HOME = default_kiro_home()
 WORKSPACE_SESSIONS_DIR = KIRO_HOME / "workspace-sessions"
+KIRO_CLI_SESSIONS_DIR = default_kiro_cli_sessions_dir()
 
 # ──────────────────────────────────────────────────────────────
 # JSON fast path — use orjson if installed (3-5× faster than stdlib).
@@ -233,6 +242,22 @@ def format_size(num_bytes: int) -> str:
         return f"{int(size)}{unit}"
     return f"{size:.1f}{unit}"
 
+def parse_iso_datetime_ms(value: Optional[str]) -> int:
+    """Parse Kiro CLI ISO timestamps, including nanosecond-style fractions."""
+    if not value:
+        return 0
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        # datetime.fromisoformat accepts microseconds, not 9-digit fractions.
+        text = re.sub(r'(\.\d{6})\d+([+-]\d\d:\d\d)$', r'\1\2', text)
+        return int(datetime.fromisoformat(text).timestamp() * 1000)
+    except Exception:
+        return 0
+
 def workspace_path_from_b64(name: str) -> str:
     """Decode the urlsafe b64 workspace folder name. Kiro pads with '_' instead of '='."""
     padded = name + ('=' * (-len(name) % 4))
@@ -258,8 +283,8 @@ def msg_text(content) -> str:
         out = []
         for sub in content:
             if isinstance(sub, dict):
-                if sub.get('type') == 'text':
-                    t = sub.get('text', '')
+                if sub.get('type') == 'text' or sub.get('kind') == 'text':
+                    t = sub.get('text', sub.get('data', ''))
                     if isinstance(t, str):
                         out.append(t)
                 else:
@@ -827,6 +852,171 @@ def scan_all_sessions() -> List[SessionEntry]:
                 ws_b64=ws_dir.name,
             ))
     # newest first
+    sessions.sort(key=lambda s: s.date_created, reverse=True)
+    return sessions
+
+
+# ──────────────────────────────────────────────────────────────
+# Kiro CLI session registry — scan ~/.kiro/sessions/cli/*.json
+# ──────────────────────────────────────────────────────────────
+class CliSessionEntry:
+    __slots__ = ('session_id', 'title', 'date_created', 'created_ms',
+                 'updated_ms', 'created_at', 'updated_at', 'workspace_dir',
+                 'hidden', 'session_file', 'workspace_b64',
+                 'continuation_count', 'message_count', 'turn_count',
+                 'session_created_reason', '_preview_first_user',
+                 '_preview_from_compaction', '_preview_summary_heading',
+                 '_preview_loaded')
+
+    def __init__(self, sid: str, title: str, created_ms: int, updated_ms: int,
+                 created_at: str, updated_at: str, cwd: str, session_file: Path,
+                 message_count: int, turn_count: int, reason: str):
+        self.session_id = sid
+        self.title = title or ""
+        # For list views and workspace summaries, "date_created" means activity
+        # time. The actual created timestamp is kept separately for export.
+        self.date_created: int = int(updated_ms or created_ms or 0)
+        self.created_ms = int(created_ms or 0)
+        self.updated_ms = int(updated_ms or created_ms or 0)
+        self.created_at = created_at or ""
+        self.updated_at = updated_at or ""
+        self.workspace_dir = cwd or ""
+        self.hidden = False
+        self.session_file: Path = session_file
+        self.workspace_b64 = ""
+        self.continuation_count = 0
+        self.message_count = int(message_count or 0)
+        self.turn_count = int(turn_count or 0)
+        self.session_created_reason = reason or ""
+        self._preview_first_user: Optional[str] = None
+        self._preview_summary_heading: Optional[str] = None
+        self._preview_from_compaction = False
+        self._preview_loaded = False
+
+    def load_preview(self, head_bytes: int = 512 * 1024):
+        if self._preview_loaded:
+            return
+        self._preview_loaded = True
+        self._preview_first_user = normalize_title_candidate(self.title or '')
+        try:
+            data = _json_load_path(self.session_file)
+            turns = (((data.get('session_state') or {})
+                      .get('conversation_metadata') or {})
+                     .get('user_turn_metadatas') or [])
+            for turn in turns:
+                ok = (turn.get('result') or {}).get('Ok')
+                if not isinstance(ok, dict):
+                    continue
+                for block in ok.get('content') or []:
+                    if isinstance(block, dict) and block.get('kind') == 'text':
+                        text = block.get('data') or ''
+                        if isinstance(text, str) and text.strip():
+                            self._preview_first_user = normalize_title_candidate(text)
+                            return
+        except Exception:
+            return
+
+    @property
+    def stripped_title(self) -> str:
+        return (self.title or '').strip()
+
+    @property
+    def display_title(self) -> str:
+        return self.stripped_title or '(untitled)'
+
+    @property
+    def preview_text(self) -> str:
+        return self._preview_first_user or ''
+
+    @property
+    def from_compaction(self) -> bool:
+        return False
+
+    @property
+    def is_empty_helper(self) -> bool:
+        return (
+            self.session_created_reason == 'subagent'
+            and self.message_count == 0
+            and self.turn_count == 0
+        )
+
+    @property
+    def date(self) -> datetime:
+        ms = self.updated_ms or self.date_created or self.created_ms
+        if ms:
+            try:
+                return datetime.fromtimestamp(ms / 1000.0)
+            except Exception:
+                pass
+        try:
+            return datetime.fromtimestamp(self.session_file.stat().st_mtime)
+        except Exception:
+            return datetime.fromtimestamp(0)
+
+    @property
+    def size(self) -> int:
+        total = 0
+        try:
+            total += self.session_file.stat().st_size
+        except Exception:
+            pass
+        for extra in (self.session_file.with_suffix('.jsonl'), self.session_file.with_suffix('.history')):
+            try:
+                if extra.exists():
+                    total += extra.stat().st_size
+            except Exception:
+                pass
+        return total
+
+
+def scan_cli_sessions() -> List[CliSessionEntry]:
+    """Read every Kiro CLI session JSON and return browser-ready entries."""
+    sessions: List[CliSessionEntry] = []
+    if not KIRO_CLI_SESSIONS_DIR.exists():
+        return sessions
+    for fp in KIRO_CLI_SESSIONS_DIR.glob("*.json"):
+        if not fp.is_file():
+            continue
+        try:
+            data = _json_load_path(fp)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        turns = (((data.get('session_state') or {})
+                  .get('conversation_metadata') or {})
+                 .get('user_turn_metadatas') or [])
+        if not isinstance(turns, list):
+            turns = []
+        message_count = 0
+        for turn in turns:
+            ids = turn.get('message_ids') if isinstance(turn, dict) else None
+            if isinstance(ids, list):
+                message_count += len(ids)
+        if not message_count:
+            message_count = len(turns)
+        created_at = data.get('created_at') or ''
+        updated_at = data.get('updated_at') or ''
+        created_ms = parse_iso_datetime_ms(created_at)
+        updated_ms = parse_iso_datetime_ms(updated_at)
+        if not updated_ms:
+            try:
+                updated_ms = int(fp.stat().st_mtime * 1000)
+            except Exception:
+                updated_ms = created_ms
+        sessions.append(CliSessionEntry(
+            sid=data.get('session_id') or fp.stem,
+            title=data.get('title') or '',
+            created_ms=created_ms,
+            updated_ms=updated_ms,
+            created_at=created_at,
+            updated_at=updated_at,
+            cwd=data.get('cwd') or '',
+            session_file=fp,
+            message_count=message_count,
+            turn_count=len(turns),
+            reason=data.get('session_created_reason') or '',
+        ))
     sessions.sort(key=lambda s: s.date_created, reverse=True)
     return sessions
 
@@ -1867,6 +2057,695 @@ class SessionParser:
         return "\n".join(md)
 
 
+class CliSessionParser:
+    """Parser for Kiro CLI session files.
+
+    `<session>.json` is only a compact session index. The detailed transcript
+    lives beside it as `<session>.jsonl`, with Prompt / AssistantMessage /
+    ToolResults / Compaction events. Prefer JSONL so file writes, reads,
+    commands, MCP calls, web activity, and task/subagent records are visible.
+    """
+
+    def __init__(self, entry: CliSessionEntry):
+        self.entry = entry
+        self.session_id = entry.session_id
+        self.workspace_dir = entry.workspace_dir
+        self.title = entry.title or "Untitled CLI Session"
+        self.date_created = entry.created_ms or entry.date_created
+        self.hidden = False
+
+        self.metadata: Dict = {}
+        self.data: List[Dict] = []
+
+        self.started_from_compaction = False
+        self.compaction_count = 0
+        self.continuation_count = 0
+        self.parent_session_ids: List[str] = []
+
+        self.model_titles: Set[str] = set()
+        self.autonomy_mode: Optional[str] = None
+        self.session_type: Optional[str] = "Kiro CLI"
+        self.user_turn_count = entry.turn_count
+        self.execution_count = 0
+        self.context_usage_pct = 0.0
+        self.credits_used = 0.0
+        self._pending_tool_uses: Dict[str, Dict] = {}
+        self._pending_item_idx: Dict[str, int] = {}
+
+        self._load()
+
+    @staticmethod
+    def _json_text(value, indent: int = 2) -> str:
+        if value is None:
+            return ''
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, indent=indent)
+        except Exception:
+            return str(value)
+
+    @staticmethod
+    def _tool_args(tool_input) -> Tuple[Dict, str]:
+        if isinstance(tool_input, dict):
+            purpose = tool_input.get('__tool_use_purpose') or ''
+            args = {k: v for k, v in tool_input.items() if k != '__tool_use_purpose'}
+            return args, purpose
+        return {'input': tool_input}, ''
+
+    @staticmethod
+    def _error_kind(err) -> str:
+        if isinstance(err, dict):
+            stream = err.get('Stream')
+            if isinstance(stream, dict):
+                kind = stream.get('kind')
+                if isinstance(kind, dict) and kind.get('kind'):
+                    return str(kind.get('kind'))
+                if kind:
+                    return str(kind)
+            return next(iter(err.keys()), 'cli_error')
+        return 'cli_error'
+
+    @classmethod
+    def _error_message(cls, err) -> str:
+        if isinstance(err, dict):
+            stream = err.get('Stream')
+            if isinstance(stream, dict):
+                kind = stream.get('kind')
+                if isinstance(kind, dict) and kind.get('kind') == 'interrupted':
+                    return 'CLI stream interrupted.'
+        return cls._json_text(err)
+
+    def _append_item(self, item: Dict, tool_use_id: Optional[str] = None):
+        idx = len(self.data)
+        self.data.append(item)
+        if tool_use_id:
+            self._pending_item_idx[tool_use_id] = idx
+
+    def _jsonl_path(self) -> Path:
+        return self.entry.session_file.with_suffix('.jsonl')
+
+    @classmethod
+    def _result_items_to_text(cls, items) -> str:
+        parts: List[str] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            if 'Text' in item:
+                parts.append(str(item.get('Text') or ''))
+            elif 'Json' in item:
+                parts.append(cls._json_text(item.get('Json')))
+            elif 'Error' in item:
+                parts.append(cls._json_text(item.get('Error')))
+            else:
+                parts.append(cls._json_text(item))
+        return '\n'.join(p for p in parts if p)
+
+    @staticmethod
+    def _first_json_item(items):
+        for item in items or []:
+            if isinstance(item, dict) and isinstance(item.get('Json'), dict):
+                return item.get('Json')
+        return None
+
+    @staticmethod
+    def _builtin_tool(result_obj) -> Tuple[str, Dict, str]:
+        tool = (result_obj or {}).get('tool') or {}
+        purpose = tool.get('tool_use_purpose') or ''
+        kind = tool.get('kind') or {}
+        if isinstance(kind, dict) and isinstance(kind.get('BuiltIn'), dict):
+            built = kind.get('BuiltIn') or {}
+            if built:
+                name = next(iter(built.keys()))
+                params = built.get(name) if isinstance(built.get(name), dict) else {}
+                return name, params or {}, purpose
+        return '', {}, purpose
+
+    @staticmethod
+    def _mcp_tool(result_obj) -> Tuple[str, str, Dict, str]:
+        tool = (result_obj or {}).get('tool') or {}
+        purpose = tool.get('tool_use_purpose') or ''
+        kind = tool.get('kind') or {}
+        if isinstance(kind, dict) and isinstance(kind.get('Mcp'), dict):
+            mcp = kind.get('Mcp') or {}
+            return (
+                mcp.get('serverName') or 'mcp',
+                mcp.get('toolName') or 'tool',
+                mcp.get('params') or {},
+                purpose,
+            )
+        return '', '', {}, purpose
+
+    @classmethod
+    def _result_payload(cls, result_obj) -> Tuple[str, List[Dict], str]:
+        result = (result_obj or {}).get('result') or {}
+        if isinstance(result, dict) and isinstance(result.get('Success'), dict):
+            items = result.get('Success', {}).get('items') or []
+            return 'Success', items, ''
+        if isinstance(result, dict) and isinstance(result.get('Error'), dict):
+            err = result.get('Error') or {}
+            items = err.get('items') or []
+            return 'Error', items, cls._json_text(err)
+        return '', [], cls._json_text(result)
+
+    @staticmethod
+    def _read_files_from_ops(ops) -> List[Dict]:
+        files = []
+        for op in ops or []:
+            if not isinstance(op, dict):
+                continue
+            files.append({
+                'path': op.get('path') or '?',
+                'start': op.get('offset'),
+                'end': None,
+            })
+        return files
+
+    def _append_file_write(self, args: Dict, purpose: str, execution_id: str,
+                           state: str = 'Requested', error: str = ''):
+        command = str(args.get('command') or '').lower()
+        path = args.get('path') or args.get('file_path') or '?'
+        if command in ('delete', 'remove', 'rm', 'unlink'):
+            self._append_item({
+                'type': 'file_delete',
+                'path': path,
+                'explanation': purpose,
+                'state': state,
+                'error': error,
+                'execution_id': execution_id,
+            }, execution_id)
+            return
+        if command in ('strreplace', 'replace', 'edit', 'insert', 'append', 'update'):
+            self._append_item({
+                'type': 'file_edit',
+                'path': path,
+                'tool': f"write:{command or 'edit'}",
+                'original_content': args.get('oldStr') or args.get('old') or '',
+                'modified_content': args.get('newStr') or args.get('new') or args.get('content') or '',
+                'explanation': purpose,
+                'state': state,
+                'error': error,
+                'execution_id': execution_id,
+            }, execution_id)
+            return
+        self._append_item({
+            'type': 'file_create',
+            'path': path,
+            'modified_content': args.get('content') or args.get('newStr') or '',
+            'explanation': purpose,
+            'state': state,
+            'error': error,
+            'execution_id': execution_id,
+        }, execution_id)
+
+    def _load(self):
+        data = _json_load_path(self.entry.session_file)
+        self.metadata = {
+            'source': 'Kiro CLI',
+            'session_id': self.session_id,
+            'cwd': self.workspace_dir,
+            'created_at': self.entry.created_at,
+            'updated_at': self.entry.updated_at,
+            'session_created_reason': self.entry.session_created_reason,
+            'message_count': self.entry.message_count,
+            'turn_count': self.entry.turn_count,
+        }
+        reason = self.entry.session_created_reason
+        if reason:
+            self.session_type = f"Kiro CLI ({reason})"
+
+        jsonl_path = self._jsonl_path()
+        if jsonl_path.exists():
+            self.metadata['event_stream'] = str(jsonl_path)
+            try:
+                self.metadata['event_stream_size'] = format_size(jsonl_path.stat().st_size)
+            except Exception:
+                pass
+            self._load_jsonl(jsonl_path)
+            return
+
+        title = (self.title or '').strip()
+        if title:
+            self.data.append({
+                'type': 'user_message',
+                'content': f"Kiro CLI session title / first prompt:\n\n{title}",
+                'hidden': False,
+            })
+
+        turns = (((data.get('session_state') or {})
+                  .get('conversation_metadata') or {})
+                 .get('user_turn_metadatas') or [])
+        if not isinstance(turns, list):
+            turns = []
+        self.user_turn_count = len(turns)
+
+        for i, turn in enumerate(turns, start=1):
+            if not isinstance(turn, dict):
+                continue
+            self.execution_count += int(turn.get('builtin_tool_uses') or 0)
+            ctx = turn.get('context_usage_percentage')
+            if isinstance(ctx, (int, float)):
+                self.context_usage_pct = max(self.context_usage_pct, float(ctx))
+            for usage in turn.get('metering_usage') or []:
+                if isinstance(usage, dict) and isinstance(usage.get('value'), (int, float)):
+                    self.credits_used += float(usage.get('value') or 0)
+
+            result = turn.get('result') or {}
+            if isinstance(result, dict) and 'Err' in result:
+                err = result.get('Err')
+                self.data.append({
+                    'type': 'error',
+                    'kind': self._error_kind(err),
+                    'message': self._error_message(err),
+                    'execution_id': f"cli-turn-{i}",
+                })
+                continue
+
+            ok = result.get('Ok') if isinstance(result, dict) else None
+            if not isinstance(ok, dict):
+                continue
+            role = ok.get('role') or 'assistant'
+            for block in ok.get('content') or []:
+                if not isinstance(block, dict):
+                    continue
+                kind = block.get('kind')
+                block_data = block.get('data')
+                if kind == 'text':
+                    text = block_data if isinstance(block_data, str) else self._json_text(block_data)
+                    if text and text.strip():
+                        self.data.append({
+                            'type': 'user_message' if role == 'user' else 'agent_message',
+                            'content': text,
+                            'hidden': False,
+                            'execution_id': f"cli-turn-{i}",
+                        })
+                elif kind == 'thinking':
+                    text = ''
+                    if isinstance(block_data, dict):
+                        text = block_data.get('text') or ''
+                        model = block_data.get('modelId') or block_data.get('model_id')
+                        if model:
+                            self.model_titles.add(str(model))
+                    else:
+                        text = self._json_text(block_data)
+                    if text and text.strip():
+                        self.data.append({
+                            'type': 'reasoning',
+                            'content': text,
+                            'execution_id': f"cli-turn-{i}",
+                        })
+                elif kind == 'toolUse':
+                    self._append_tool_use(block_data, i)
+                elif kind:
+                    self.data.append({
+                        'type': 'session_event',
+                        'event': str(kind),
+                        'content': f"CLI content block: {kind}",
+                        'execution_id': f"cli-turn-{i}",
+                    })
+
+    def _load_jsonl(self, jsonl_path: Path):
+        prompt_count = 0
+        assistant_count = 0
+        line_count = 0
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for line_count, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                kind = obj.get('kind')
+                data = obj.get('data') or {}
+                if kind == 'Prompt':
+                    prompt_count += 1
+                    content = msg_text(data.get('content') or [])
+                    if content.strip():
+                        self._append_item({
+                            'type': 'user_message',
+                            'content': content,
+                            'hidden': False,
+                            'execution_id': data.get('message_id') or f"cli-prompt-{prompt_count}",
+                        })
+                elif kind == 'AssistantMessage':
+                    assistant_count += 1
+                    self._append_cli_message_blocks(
+                        data.get('content') or [],
+                        data.get('message_id') or f"cli-assistant-{assistant_count}",
+                        role='assistant',
+                    )
+                elif kind == 'ToolResults':
+                    for tool_use_id, result_obj in (data.get('results') or {}).items():
+                        self._append_tool_result(tool_use_id, result_obj)
+                elif kind == 'Compaction':
+                    summary = data.get('summary') or data.get('content') or self._json_text(data)
+                    self.compaction_count += 1
+                    self._append_item({
+                        'type': 'session_event',
+                        'event': 'context_compacted',
+                        'content': 'Context compacted',
+                        'execution_id': f"cli-compaction-{self.compaction_count}",
+                    })
+                    if summary and str(summary).strip():
+                        self._append_item({
+                            'type': 'summarization',
+                            'where': 'inline',
+                            'content': str(summary),
+                            'execution_id': f"cli-compaction-{self.compaction_count}",
+                        })
+                else:
+                    self._append_item({
+                        'type': 'session_event',
+                        'event': str(kind or 'unknown'),
+                        'content': f"CLI event: {kind or 'unknown'}",
+                    })
+        self.user_turn_count = prompt_count or self.entry.turn_count
+        self.metadata['jsonl_events'] = line_count
+        if not self.data and self.title:
+            self._append_item({
+                'type': 'user_message',
+                'content': f"Kiro CLI session title / first prompt:\n\n{self.title}",
+                'hidden': False,
+            })
+
+    def _append_cli_message_blocks(self, blocks, execution_id: str, role: str = 'assistant'):
+        for block in blocks or []:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get('kind')
+            block_data = block.get('data')
+            if kind == 'text':
+                text = block_data if isinstance(block_data, str) else self._json_text(block_data)
+                if text and text.strip():
+                    self._append_item({
+                        'type': 'user_message' if role == 'user' else 'agent_message',
+                        'content': text,
+                        'hidden': False,
+                        'execution_id': execution_id,
+                    })
+            elif kind == 'thinking':
+                text = ''
+                if isinstance(block_data, dict):
+                    text = block_data.get('text') or ''
+                    model = block_data.get('modelId') or block_data.get('model_id')
+                    if model:
+                        self.model_titles.add(str(model))
+                else:
+                    text = self._json_text(block_data)
+                if text and text.strip():
+                    self._append_item({
+                        'type': 'reasoning',
+                        'content': text,
+                        'execution_id': execution_id,
+                    })
+            elif kind == 'toolUse':
+                self._append_tool_use(block_data, 0)
+            elif kind:
+                self._append_item({
+                    'type': 'session_event',
+                    'event': str(kind),
+                    'content': f"CLI content block: {kind}",
+                    'execution_id': execution_id,
+                })
+
+    def _append_tool_result(self, tool_use_id: str, result_obj):
+        status, items, error = self._result_payload(result_obj)
+        built_name, params, purpose = self._builtin_tool(result_obj)
+        server, mcp_name, mcp_params, mcp_purpose = self._mcp_tool(result_obj)
+        text = self._result_items_to_text(items)
+        json_item = self._first_json_item(items)
+        pending = self._pending_tool_uses.get(tool_use_id) or {}
+        idx = self._pending_item_idx.get(tool_use_id)
+
+        if idx is not None and 0 <= idx < len(self.data):
+            item = self.data[idx]
+            if status == 'Error':
+                item['state'] = 'Error'
+                item['error'] = error or text
+            elif status:
+                item['state'] = status
+            if item.get('type') == 'mcp_tool' and text:
+                item['response'] = text
+            elif item.get('type') == 'sub_agent' and text and item.get('kind') != 'response':
+                self._append_item({
+                    'type': 'sub_agent',
+                    'kind': 'response',
+                    'response': text,
+                    'execution_id': tool_use_id,
+                })
+
+        if built_name == 'ExecuteCmd':
+            if idx is None:
+                self._append_item({
+                    'type': 'terminal_cmd',
+                    'tool': 'shell',
+                    'command': params.get('command') or '',
+                    'cwd': params.get('working_dir') or self.workspace_dir,
+                    'explanation': purpose,
+                    'state': status or 'Finished',
+                    'error': error,
+                    'execution_id': tool_use_id,
+                }, tool_use_id)
+            out = ''
+            exit_code = None
+            if isinstance(json_item, dict):
+                out = json_item.get('stdout') or ''
+                stderr = json_item.get('stderr') or ''
+                if stderr:
+                    out = (out + '\n' if out else '') + stderr
+                exit_status = str(json_item.get('exit_status') or '')
+                m = re.search(r'(-?\d+)', exit_status)
+                if m:
+                    try:
+                        exit_code = int(m.group(1))
+                    except Exception:
+                        exit_code = None
+            if not out:
+                out = text
+            self._append_item({
+                'type': 'terminal_output',
+                'output': out,
+                'exit_code': exit_code,
+                'execution_id': tool_use_id,
+            })
+            return
+
+        if built_name == 'FileRead':
+            self._append_item({
+                'type': 'file_read',
+                'tool': 'read',
+                'files': self._read_files_from_ops(params.get('operations') or []),
+                'output': text,
+                'state': status or 'Finished',
+                'error': error,
+                'execution_id': tool_use_id,
+            })
+            return
+
+        if built_name == 'FileWrite':
+            if idx is None:
+                self._append_file_write(params, purpose, tool_use_id, status or 'Finished', error)
+            return
+
+        if built_name in ('Grep', 'Glob', 'Code'):
+            query = params.get('pattern') or params.get('query') or params.get('operation') or built_name
+            if idx is not None and 0 <= idx < len(self.data) and self.data[idx].get('type') == 'code_search':
+                self.data[idx]['output'] = text
+                self.data[idx]['error'] = error
+                if query:
+                    self.data[idx]['query'] = str(query)
+            else:
+                self._append_item({
+                    'type': 'code_search',
+                    'query': str(query),
+                    'why': purpose,
+                    'output': text,
+                    'error': error,
+                    'execution_id': tool_use_id,
+                })
+            return
+
+        if built_name == 'WebSearch':
+            results = []
+            if isinstance(json_item, dict):
+                results = json_item.get('results') or []
+            if idx is not None and 0 <= idx < len(self.data) and self.data[idx].get('type') == 'web_search':
+                self.data[idx]['results'] = results
+                self.data[idx]['error'] = error
+                self.data[idx]['query'] = params.get('query') or self.data[idx].get('query') or ''
+            else:
+                self._append_item({
+                    'type': 'web_search',
+                    'query': params.get('query') or pending.get('args', {}).get('query') or '',
+                    'results': results,
+                    'error': error,
+                    'execution_id': tool_use_id,
+                })
+            return
+
+        if built_name == 'WebFetch':
+            if idx is not None and 0 <= idx < len(self.data) and self.data[idx].get('type') == 'web_fetch':
+                self.data[idx]['content'] = text
+                self.data[idx]['error'] = error
+                self.data[idx]['url'] = params.get('url') or self.data[idx].get('url') or ''
+                self.data[idx]['mode'] = params.get('mode') or self.data[idx].get('mode') or ''
+            else:
+                self._append_item({
+                    'type': 'web_fetch',
+                    'url': params.get('url') or pending.get('args', {}).get('url') or '',
+                    'mode': params.get('mode') or '',
+                    'content': text,
+                    'error': error,
+                    'execution_id': tool_use_id,
+                })
+            return
+
+        if built_name in ('Task', 'AgentCrew'):
+            if idx is None:
+                self._append_item({
+                    'type': 'sub_agent',
+                    'kind': 'response',
+                    'response': text,
+                    'execution_id': tool_use_id,
+                })
+            return
+
+        if server or mcp_name:
+            if idx is None:
+                self._append_item({
+                    'type': 'mcp_tool',
+                    'server': server or 'mcp',
+                    'tool_name': mcp_name or 'tool',
+                    'arguments': mcp_params,
+                    'response': text,
+                    'state': status or 'Finished',
+                    'error': error,
+                    'execution_id': tool_use_id,
+                }, tool_use_id)
+            return
+
+        if text and idx is None:
+            self._append_item({
+                'type': 'session_event',
+                'event': built_name or pending.get('name') or 'toolResult',
+                'content': text[:2000],
+                'execution_id': tool_use_id,
+            })
+
+    def _append_tool_use(self, block_data, turn_index: int):
+        if not isinstance(block_data, dict):
+            self.data.append({
+                'type': 'session_event',
+                'event': 'toolUse',
+                'content': self._json_text(block_data),
+                'execution_id': f"cli-turn-{turn_index}",
+            })
+            return
+
+        name = str(block_data.get('name') or 'tool')
+        args, purpose = self._tool_args(block_data.get('input'))
+        execution_id = block_data.get('toolUseId') or f"cli-turn-{turn_index}"
+        self._pending_tool_uses[execution_id] = {
+            'name': name,
+            'args': args,
+            'purpose': purpose,
+        }
+
+        if name == 'shell':
+            command = args.get('command') or ''
+            self._append_item({
+                'type': 'terminal_cmd',
+                'tool': 'shell',
+                'command': self._json_text(command, indent=0),
+                'cwd': args.get('cwd') or args.get('working_dir') or self.workspace_dir,
+                'explanation': purpose,
+                'state': 'Requested',
+                'execution_id': execution_id,
+            }, execution_id)
+            return
+
+        if name == 'write':
+            self._append_file_write(args, purpose, execution_id)
+            return
+
+        if name == 'read':
+            # The ToolResults event carries the actual file content. Keep this
+            # pending so FileRead can render as one read block with output.
+            return
+
+        if name in ('grep', 'glob', 'code'):
+            query = args.get('pattern') or args.get('query') or args.get('operation') or name
+            self._append_item({
+                'type': 'code_search',
+                'query': str(query),
+                'why': purpose,
+                'output': '',
+                'execution_id': execution_id,
+            }, execution_id)
+            return
+
+        if name == 'web_search':
+            self._append_item({
+                'type': 'web_search',
+                'query': args.get('query') or '',
+                'results': [],
+                'execution_id': execution_id,
+            }, execution_id)
+            return
+
+        if name == 'web_fetch':
+            self._append_item({
+                'type': 'web_fetch',
+                'url': args.get('url') or '',
+                'mode': args.get('mode') or '',
+                'content': '',
+                'execution_id': execution_id,
+            }, execution_id)
+            return
+
+        if name == 'subagent':
+            self._append_item({
+                'type': 'sub_agent',
+                'kind': 'invoke',
+                'name': args.get('agent') or args.get('mode') or 'subagent',
+                'prompt': args.get('task') or args.get('prompt') or '',
+                'explanation': purpose,
+                'execution_id': execution_id,
+            }, execution_id)
+            return
+
+        if name == 'todo_list':
+            command = args.get('command') or 'update'
+            update = args.get('context_update') or self._json_text(args)
+            self._append_item({
+                'type': 'session_event',
+                'event': 'todo_list',
+                'content': f"todo_list {command}: {update}",
+                'execution_id': execution_id,
+            }, execution_id)
+            return
+
+        server = 'obsidian' if name.startswith('vault_') else 'kiro-cli'
+        self._append_item({
+            'type': 'mcp_tool',
+            'server': server,
+            'tool_name': name,
+            'arguments': args,
+            'response': '',
+            'state': 'Requested',
+            'execution_id': execution_id,
+        }, execution_id)
+
+    get_turn_boundaries = SessionParser.get_turn_boundaries
+    get_turn_count = SessionParser.get_turn_count
+    trim_to_last_n_turns = SessionParser.trim_to_last_n_turns
+    trim_to_live_context = SessionParser.trim_to_live_context
+    count_lines_by_section = SessionParser.count_lines_by_section
+    to_markdown = SessionParser.to_markdown
+
+
 # ──────────────────────────────────────────────────────────────
 # Heuristics
 # ──────────────────────────────────────────────────────────────
@@ -2459,29 +3338,137 @@ def maybe_open_directory(written_paths: List[Path]):
     so the user lands inside the exact folder they expect."""
     if not written_paths:
         return
-    # All files are saved to the same out_dir in this script, so picking
-    # any one and using its parent is correct. Resolve it now and show it
-    # to the user before opening so they can verify.
-    target_dir = written_paths[0].resolve().parent
+    dirs: List[Path] = []
+    seen: Set[str] = set()
+    for p in written_paths:
+        try:
+            d = p.resolve().parent
+        except Exception:
+            d = p.parent
+        key = _norm_ws_path(str(d))
+        if key not in seen:
+            seen.add(key)
+            dirs.append(d)
+    if not dirs:
+        return
+    target_label = str(dirs[0]) if len(dirs) == 1 else f"{len(dirs)} output directories"
     answer = input(
         f"\n  {Style.BOLD}Open output directory?{Style.RESET}  "
-        f"{Style.DIM}{target_dir}{Style.RESET}  "
+        f"{Style.DIM}{target_label}{Style.RESET}  "
         f"{Style.BOLD}[Y/n] {Style.RESET}"
     ).strip().lower()
     if answer and answer not in ('y', 'yes'):
         return
-    success, opened = open_in_file_explorer(target_dir)
-    if success:
-        print(f"  {Style.GREEN}➜{Style.RESET} Opened {opened}")
-    else:
-        print(f"  {Style.warn('Could not open file explorer.')}  "
-              f"{Style.DIM}({opened or target_dir}){Style.RESET}")
+    for target_dir in dirs:
+        success, opened = open_in_file_explorer(target_dir)
+        if success:
+            print(f"  {Style.GREEN}➜{Style.RESET} Opened {opened}")
+        else:
+            print(f"  {Style.warn('Could not open file explorer.')}  "
+                  f"{Style.DIM}({opened or target_dir}){Style.RESET}")
+
+
+def script_output_directory() -> Path:
+    try:
+        return Path(__file__).parent.resolve()
+    except NameError:
+        return Path.cwd().resolve()
+
+
+def _project_dirs_from_parsers(parsers: List['SessionParser']) -> List[Path]:
+    dirs: List[Path] = []
+    seen: Set[str] = set()
+    for p in parsers:
+        ws = getattr(p, 'workspace_dir', '') or ''
+        if not ws:
+            continue
+        try:
+            d = Path(ws).expanduser().resolve()
+        except Exception:
+            continue
+        if not d.exists() or not d.is_dir():
+            continue
+        key = _norm_ws_path(str(d))
+        if key not in seen:
+            seen.add(key)
+            dirs.append(d)
+    return dirs
+
+
+def choose_output_location(parsers: List['SessionParser'], file_mode: str) -> Tuple[str, Path]:
+    """Return ('single'|'per_project', directory).
+
+    If selected session project dir and script dir are the same, no prompt.
+    For multiple workspaces and separate files, the user may save each file
+    next to its own project; combined exports use one chosen directory.
+    """
+    script_dir = script_output_directory()
+    project_dirs = _project_dirs_from_parsers(parsers)
+    if not project_dirs:
+        return 'single', script_dir
+
+    if len(project_dirs) == 1:
+        project_dir = project_dirs[0]
+        if _norm_ws_path(str(project_dir)) == _norm_ws_path(str(script_dir)):
+            return 'single', script_dir
+        while True:
+            print(f"\n  {Style.BOLD}Save Markdown file(s) where?{Style.RESET}")
+            print(f"    {Style.YELLOW}[P]{Style.RESET}roject directory  {Style.DIM}{project_dir}{Style.RESET}  {Style.DIM}[Default]{Style.RESET}")
+            print(f"    {Style.YELLOW}[S]{Style.RESET}cript directory   {Style.DIM}{script_dir}{Style.RESET}")
+            ans = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower() or 'p'
+            if ans in ('p', 'project', 'workspace'):
+                return 'single', project_dir
+            if ans in ('s', 'script'):
+                return 'single', script_dir
+            print(f"  {Style.warn(f'Unrecognised input {ans!r}. Please type P or S.')}")
+
+    if file_mode == 'separate':
+        while True:
+            print(f"\n  {Style.BOLD}Save Markdown files where?{Style.RESET}")
+            print(f"    {Style.YELLOW}[P]{Style.RESET}roject directories  {Style.DIM}(each session saved in its own workspace){Style.RESET}  {Style.DIM}[Default]{Style.RESET}")
+            print(f"    {Style.YELLOW}[S]{Style.RESET}cript directory     {Style.DIM}{script_dir}{Style.RESET}")
+            ans = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower() or 'p'
+            if ans in ('p', 'project', 'projects', 'workspace', 'workspaces'):
+                return 'per_project', script_dir
+            if ans in ('s', 'script'):
+                return 'single', script_dir
+            print(f"  {Style.warn(f'Unrecognised input {ans!r}. Please type P or S.')}")
+
+    first_project = project_dirs[0]
+    if _norm_ws_path(str(first_project)) == _norm_ws_path(str(script_dir)):
+        return 'single', script_dir
+    while True:
+        print(f"\n  {Style.BOLD}Save combined Markdown file where?{Style.RESET}")
+        print(f"    {Style.YELLOW}[P]{Style.RESET}roject directory  {Style.DIM}{first_project}{Style.RESET}  {Style.DIM}[Default]{Style.RESET}")
+        print(f"    {Style.YELLOW}[S]{Style.RESET}cript directory   {Style.DIM}{script_dir}{Style.RESET}")
+        print(f"    {Style.DIM}Multiple project directories were selected; project means the first selected session's workspace.{Style.RESET}")
+        ans = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower() or 'p'
+        if ans in ('p', 'project', 'workspace'):
+            return 'single', first_project
+        if ans in ('s', 'script'):
+            return 'single', script_dir
+        print(f"  {Style.warn(f'Unrecognised input {ans!r}. Please type P or S.')}")
+
+
+def output_path_for_parser(parser: 'SessionParser', filename: str,
+                           output_mode: str, fallback_dir: Path) -> Path:
+    if output_mode == 'per_project':
+        ws = getattr(parser, 'workspace_dir', '') or ''
+        try:
+            d = Path(ws).expanduser().resolve()
+            if d.exists() and d.is_dir():
+                return d / filename
+        except Exception:
+            pass
+    return fallback_dir / filename
 
 def print_menu_header(workspace_filter: Optional[str], total_sessions: int,
-                      total_workspaces: int, cwd_match: Optional[str] = None):
+                      total_workspaces: int, cwd_match: Optional[str] = None,
+                      source_label: str = "Kiro IDE",
+                      storage_path: Optional[Path] = None):
     _clear_screen()
-    print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}v1.1{Style.RESET}")
-    print(f"{Style.DIM}Storage:   {KIRO_HOME}{Style.RESET}")
+    print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}v1.2 · {source_label}{Style.RESET}")
+    print(f"{Style.DIM}Storage:   {storage_path or KIRO_HOME}{Style.RESET}")
     try:
         out = Path(__file__).parent.resolve()
     except NameError:
@@ -2515,14 +3502,23 @@ def print_workspace_summary(all_sessions: List[SessionEntry],
             rel = format_relative_time(last_ms / 1000.0)
         except Exception:
             rel = ''
-        marks = []
-        if ws == current: marks.append(f'{Style.GREEN}●{Style.RESET}')
-        if ws == cwd_match: marks.append(f'{Style.CYAN}◆{Style.RESET}')
-        marker = ' '.join(marks) if marks else ' '
         short = short_workspace(ws)
         count = f'{len(lst):>3} sess'
+        marks = []
+        if ws == current:
+            if ws == cwd_match:
+                marks.append('●◆')
+            else:
+                marks.append('●')
+            marker = ' '.join(marks) if marks else ' '
+            row = f"    w{i}  {marker:<2} {count}  {rel:<14} {short}"
+            print(f"{Style.BG_SELECTED}{Style.BOLD}{row}{Style.RESET}")
+            continue
+        if ws == cwd_match: marks.append(f'{Style.CYAN}◆{Style.RESET}')
+        marker = ' '.join(marks) if marks else ' '
         num = f'{Style.YELLOW}w{i}{Style.RESET}'
-        print(f"    {num}  {marker:<2} {count}  {Style.DIM}{rel:<14}{Style.RESET} {short}")
+        row = f"    {num}  {marker:<2} {count}  {Style.DIM}{rel:<14}{Style.RESET} {short}"
+        print(row)
     if len(rows) > limit:
         print(f"          {Style.DIM}... and {len(rows) - limit} more — press {Style.YELLOW}w{Style.DIM} for full list{Style.RESET}")
     print()
@@ -2530,10 +3526,19 @@ def print_workspace_summary(all_sessions: List[SessionEntry],
 def list_sessions_table(sessions: List[SessionEntry], show_workspace: bool = True,
                         chain_graph: Optional['ChainGraph'] = None):
     # Column widths
+    show_chain = chain_graph is not None
+    is_cli_table = any(hasattr(s, 'message_count') for s in sessions)
+    marker_header = 'MSGS' if is_cli_table else 'BADGE'
     if show_workspace:
-        cols = ('ID', 4), ('DATE', 30), ('WORKSPACE', 18), ('TITLE', 24), ('CHAIN', 8), ('BADGE', 8), ('PREVIEW', 44), ('SIZE', 8)
+        if show_chain:
+            cols = ('ID', 4), ('DATE', 30), ('WORKSPACE', 18), ('TITLE', 24), ('CHAIN', 8), ('BADGE', 8), ('PREVIEW', 44), ('SIZE', 8)
+        else:
+            cols = ('ID', 4), ('DATE', 30), ('WORKSPACE', 18), ('TITLE', 24), (marker_header, 8), ('PREVIEW', 53), ('SIZE', 8)
     else:
-        cols = ('ID', 4), ('DATE', 30), ('TITLE', 28), ('CHAIN', 8), ('BADGE', 8), ('PREVIEW', 56), ('SIZE', 8)
+        if show_chain:
+            cols = ('ID', 4), ('DATE', 30), ('TITLE', 28), ('CHAIN', 8), ('BADGE', 8), ('PREVIEW', 56), ('SIZE', 8)
+        else:
+            cols = ('ID', 4), ('DATE', 30), ('TITLE', 28), (marker_header, 8), ('PREVIEW', 65), ('SIZE', 8)
     header = ' '.join(f'{name:<{w}}' for name, w in cols)
     total_w = sum(w + 1 for _, w in cols) - 1
     print(f"{Style.BOLD}{header}{Style.RESET}")
@@ -2553,7 +3558,10 @@ def list_sessions_table(sessions: List[SessionEntry], show_workspace: bool = Tru
             badges.append(f'↪×{s.continuation_count}')
         if s.hidden:
             badges.append('hide')
-        badge_str = ' '.join(badges) if badges else ''
+        msg_count = getattr(s, 'message_count', 0)
+        if msg_count and not is_cli_table:
+            badges.append(f'{msg_count}m')
+        badge_str = str(msg_count) if is_cli_table and msg_count else (' '.join(badges) if badges else '')
 
         tag = ""
         row_color = Style.RESET
@@ -2570,8 +3578,11 @@ def list_sessions_table(sessions: List[SessionEntry], show_workspace: bool = Tru
 
         title_w = 24 if show_workspace else 28
         preview_w = 44 if show_workspace else 56
+        if not show_chain:
+            preview_w += 9
         display_title = fit(f"{title}{tag}", title_w)
         preview = fit(s.preview_text or '', preview_w)
+        badge_col = fit(badge_str, 8)
         date_col = f"{dt_str} {rel_str}"
         date_col = fit(date_col, 30)
 
@@ -2586,16 +3597,18 @@ def list_sessions_table(sessions: List[SessionEntry], show_workspace: bool = Tru
 
         if show_workspace:
             ws_name = fit(short_workspace(s.workspace_dir), 18)
+            chain_part = f" {chain_col:<8}" if show_chain else ""
             print(
                 f"{row_color}"
-                f"{(str(idx+1)+'  '):<4} {date_col:<30} {ws_name:<18} {display_title:<24} {chain_col:<8} {badge_str:<8} "
-                f"{Style.DIM}{preview:<44}{Style.RESET}{row_color} {size_label:<8}{Style.RESET}"
+                f"{(str(idx+1)+'  '):<4} {date_col:<30} {ws_name:<18} {display_title:<24}{chain_part} {badge_col:<8} "
+                f"{Style.DIM}{preview:<{preview_w}}{Style.RESET}{row_color} {size_label:<8}{Style.RESET}"
             )
         else:
+            chain_part = f" {chain_col:<8}" if show_chain else ""
             print(
                 f"{row_color}"
-                f"{(str(idx+1)+'  '):<4} {date_col:<30} {display_title:<28} {chain_col:<8} {badge_str:<8} "
-                f"{Style.DIM}{preview:<56}{Style.RESET}{row_color} {size_label:<8}{Style.RESET}"
+                f"{(str(idx+1)+'  '):<4} {date_col:<30} {display_title:<28}{chain_part} {badge_col:<8} "
+                f"{Style.DIM}{preview:<{preview_w}}{Style.RESET}{row_color} {size_label:<8}{Style.RESET}"
             )
     print(f"{Style.DIM}{'-' * total_w}{Style.RESET}")
 
@@ -2829,7 +3842,8 @@ def select_workspace(all_sessions: List[SessionEntry], current: Optional[str] = 
 # ──────────────────────────────────────────────────────────────
 # Chain merge export
 # ──────────────────────────────────────────────────────────────
-def _parse_sessions_parallel(entries: List['SessionEntry'], max_workers: int = 6) -> List['SessionParser']:
+def _parse_sessions_parallel(entries: List['SessionEntry'], max_workers: int = 6,
+                             parser_cls=SessionParser) -> List['SessionParser']:
     """Build SessionParsers for many sessions concurrently.
 
     SessionParser._load() opens the session JSON and every referenced
@@ -2847,7 +3861,7 @@ def _parse_sessions_parallel(entries: List['SessionEntry'], max_workers: int = 6
     def _parse_one(idx_entry):
         idx, entry = idx_entry
         try:
-            return idx, SessionParser(entry)
+            return idx, parser_cls(entry)
         except Exception as e:
             print(Style.error(f"Failed to parse {entry.session_id[:8]}: {e}"))
             return idx, None
@@ -2970,11 +3984,8 @@ def process_chain_export(chain: 'Chain'):
         input(f"\n{Style.DIM}Press Enter to continue...{Style.RESET}")
         return
 
-    try:
-        out_dir = Path(__file__).parent.resolve()
-    except NameError:
-        out_dir = Path.cwd()
     md, fname = merge_chain_to_markdown(chain, section_filter, clean_content, output_cap)
+    _mode, out_dir = choose_output_location(parsers, file_mode='combined')
     out_path = out_dir / fname
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(md)
@@ -2987,7 +3998,10 @@ def process_chain_export(chain: 'Chain'):
 # ──────────────────────────────────────────────────────────────
 # Conversion pipeline
 # ──────────────────────────────────────────────────────────────
-def process_conversion(indices_str: str, sessions: List[SessionEntry]):
+def process_conversion(indices_str: str, sessions: List[SessionEntry],
+                       parser_cls=SessionParser,
+                       build_execution_index: bool = True,
+                       allow_scope: bool = True):
     if not indices_str.strip():
         return
     try:
@@ -3000,24 +4014,26 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry]):
         return
 
     # Make sure execution index is built before parsing
-    if EXEC_INDEX is not None and not EXEC_INDEX._built:
+    if build_execution_index and EXEC_INDEX is not None and not EXEC_INDEX._built:
         EXEC_INDEX.build(progress=True)
 
     print(f"\n{Style.info(f'Parsing {len(chosen)} session(s)...')}")
-    parsers = _parse_sessions_parallel(chosen)
+    parsers = _parse_sessions_parallel(chosen, parser_cls=parser_cls)
     if not parsers:
         return
 
-    scope_type, turn_limit = select_extraction_scope(parsers)
+    scope_type, turn_limit = ('full', 0)
     scope_label = ""
-    if scope_type == 'last_n':
-        for p in parsers:
-            p.trim_to_last_n_turns(turn_limit)
-        scope_label = f"last {turn_limit} turn{'s' if turn_limit != 1 else ''}"
-    elif scope_type == 'live':
-        for p in parsers:
-            p.trim_to_live_context()
-        scope_label = "live context"
+    if allow_scope:
+        scope_type, turn_limit = select_extraction_scope(parsers)
+        if scope_type == 'last_n':
+            for p in parsers:
+                p.trim_to_last_n_turns(turn_limit)
+            scope_label = f"last {turn_limit} turn{'s' if turn_limit != 1 else ''}"
+        elif scope_type == 'live':
+            for p in parsers:
+                p.trim_to_live_context()
+            scope_label = "live context"
 
     section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap = \
         interactive_filter(parsers, scope_label=scope_label)
@@ -3063,11 +4079,11 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry]):
         else:
             print(f"  {Style.GREEN}→ Writing {len(parsers)} SEPARATE files (one per session).{Style.RESET}")
 
+    output_mode, out_dir = ('single', script_output_directory())
+    if dest in ('f', 'b'):
+        output_mode, out_dir = choose_output_location(parsers, file_mode)
+
     print(f"\n{Style.info(f'Processing {len(parsers)} session(s)...')}")
-    try:
-        out_dir = Path(__file__).parent.resolve()
-    except NameError:
-        out_dir = Path.cwd()
 
     written_paths: List[Path] = []
     clipboard_md: List[str] = []
@@ -3116,7 +4132,7 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry]):
                     else:
                         clipboard_md.append(md_content)
                 if dest in ('f', 'b'):
-                    out_path = out_dir / out_filename
+                    out_path = output_path_for_parser(parser, out_filename, output_mode, out_dir)
                     with open(out_path, 'w', encoding='utf-8') as f:
                         f.write(md_content)
                     print(f"  {Style.GREEN}➜{Style.RESET} Saved: {out_filename}  "
@@ -3138,10 +4154,122 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry]):
 
     input(f"\n{Style.DIM}Press Enter to return to menu...{Style.RESET}")
 
+
+def _find_entries_by_session_id(entries: List[SessionEntry], query: str) -> List[SessionEntry]:
+    q = (query or '').strip().lower()
+    if not q:
+        return []
+    exact = [e for e in entries if (e.session_id or '').lower() == q]
+    if exact:
+        return exact
+    if len(q) >= 8:
+        return [e for e in entries if (e.session_id or '').lower().startswith(q)]
+    return []
+
+
+def _session_match_line(source: str, entry: SessionEntry, index: Optional[int] = None) -> str:
+    try:
+        when = entry.date.strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        when = '?'
+    title = normalize_title_candidate(entry.display_title)
+    workspace = entry.workspace_dir or '?'
+    prefix = f"{Style.YELLOW}[{index}]{Style.RESET} " if index is not None else ""
+    detail = f"{source:<8}  {entry.session_id}  {when}  {short_workspace(workspace)}"
+    if hasattr(entry, 'message_count'):
+        detail += f"  msgs={getattr(entry, 'message_count', 0)}"
+    return f"  {prefix}{detail}\n      {Style.DIM}{workspace}{Style.RESET}\n      {title}"
+
+
+def interactive_find_session_by_id():
+    """Find one session ID across IDE and CLI storage, then export it."""
+    global EXEC_INDEX, CHAIN_GRAPH
+    _clear_screen()
+    print(f"\n{Style.BOLD}FIND SESSION BY ID{Style.RESET}\n")
+    sid = input(f"  {Style.BOLD}Session ID or prefix > {Style.RESET}").strip()
+    if not sid:
+        return
+
+    print(f"\n{Style.DIM}Searching IDE and CLI session stores in parallel...{Style.RESET}")
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _scan_ide():
+        return scan_all_sessions() if WORKSPACE_SESSIONS_DIR.exists() else []
+
+    def _scan_cli():
+        return scan_cli_sessions() if KIRO_CLI_SESSIONS_DIR.exists() else []
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        ide_future = ex.submit(_scan_ide)
+        cli_future = ex.submit(_scan_cli)
+        try:
+            ide_sessions = ide_future.result()
+        except Exception as e:
+            print(Style.warn(f"IDE scan failed: {e}"))
+            ide_sessions = []
+        try:
+            cli_sessions = cli_future.result()
+        except Exception as e:
+            print(Style.warn(f"CLI scan failed: {e}"))
+            cli_sessions = []
+
+    matches: List[Tuple[str, SessionEntry]] = []
+    for entry in _find_entries_by_session_id(ide_sessions, sid):
+        matches.append(('IDE', entry))
+    for entry in _find_entries_by_session_id(cli_sessions, sid):
+        matches.append(('CLI', entry))
+
+    if not matches:
+        print(Style.error(f"No session found for: {sid}"))
+        input(f"\n{Style.DIM}Press Enter to return to source menu...{Style.RESET}")
+        return
+
+    _clear_screen()
+    print(f"\n{Style.BOLD}SESSION FOUND{Style.RESET}\n")
+    if len(matches) == 1:
+        source, entry = matches[0]
+        print(Style.success(f"This session belongs to Kiro {source}."))
+        print(_session_match_line(source, entry))
+    else:
+        sources = sorted({source for source, _ in matches})
+        if 'IDE' in sources and 'CLI' in sources:
+            print(Style.warn("This session ID exists in both Kiro IDE and Kiro CLI. Choose which one to use."))
+        else:
+            print(Style.warn("Multiple sessions matched that prefix. Choose which one to use."))
+        for i, (source, entry) in enumerate(matches, start=1):
+            print(_session_match_line(source, entry, i))
+        choice = input(f"\n  {Style.BOLD}Use which match? > {Style.RESET}").strip().lower()
+        if not choice or choice == 'q':
+            return
+        if not choice.isdigit() or not (1 <= int(choice) <= len(matches)):
+            print(Style.error("Invalid selection."))
+            input(f"\n{Style.DIM}Press Enter to return to source menu...{Style.RESET}")
+            return
+        source, entry = matches[int(choice) - 1]
+
+    answer = input(f"\n  {Style.BOLD}Export this {source} session now?{Style.RESET}  {Style.BOLD}[Y/n] {Style.RESET}").strip().lower()
+    if answer and answer not in ('y', 'yes'):
+        return
+
+    if source == 'CLI':
+        EXEC_INDEX = None
+        CHAIN_GRAPH = None
+        process_conversion(
+            "1", [entry],
+            parser_cls=CliSessionParser,
+            build_execution_index=False,
+            allow_scope=False,
+        )
+    else:
+        EXEC_INDEX = ExecutionIndex(KIRO_HOME)
+        EXEC_INDEX.build(progress=True)
+        CHAIN_GRAPH = ChainGraph(ide_sessions, EXEC_INDEX)
+        process_conversion("1", [entry])
+
 # ──────────────────────────────────────────────────────────────
 # Interactive main loop
 # ──────────────────────────────────────────────────────────────
-def interactive_loop():
+def interactive_loop_ide():
     global EXEC_INDEX, CHAIN_GRAPH
     if not WORKSPACE_SESSIONS_DIR.exists():
         print(Style.error(f"Workspace-sessions folder not found: {WORKSPACE_SESSIONS_DIR}"))
@@ -3276,6 +4404,172 @@ def interactive_loop():
                 process_conversion(idx, rendered_sessions)
         elif choice:
             process_conversion(choice, rendered_sessions)
+
+
+def interactive_loop_cli():
+    global EXEC_INDEX, CHAIN_GRAPH
+    EXEC_INDEX = None
+    CHAIN_GRAPH = None
+
+    if not KIRO_CLI_SESSIONS_DIR.exists():
+        print(Style.error(f"Kiro CLI sessions folder not found: {KIRO_CLI_SESSIONS_DIR}"))
+        print(Style.info("Set KIRO_CLI_SESSIONS_DIR env var if Kiro CLI stores sessions elsewhere."))
+        sys.exit(1)
+
+    print(f"{Style.DIM}Scanning Kiro CLI sessions...{Style.RESET}")
+    all_sessions_full = scan_cli_sessions()
+    if not all_sessions_full:
+        print(Style.error("No Kiro CLI sessions found.")); sys.exit(1)
+
+    cwd_match = detect_workspace_from_cwd(all_sessions_full)
+    try:
+        script_dir = Path(__file__).parent.resolve()
+        cwd_is_script_dir = _norm_ws_path(str(Path.cwd().resolve())) == _norm_ws_path(str(script_dir))
+    except Exception:
+        cwd_is_script_dir = False
+    workspace_filter: Optional[str] = cwd_match if (cwd_match and not cwd_is_script_dir) else None
+    show_empty_helpers = False
+    sort_key = 'date'
+    view_limit = 15
+
+    def visible_base_sessions():
+        if show_empty_helpers:
+            return all_sessions_full
+        return [s for s in all_sessions_full if not getattr(s, 'is_empty_helper', False)]
+
+    def current_sessions():
+        pool = visible_base_sessions()
+        if workspace_filter:
+            pool = [s for s in pool if s.workspace_dir == workspace_filter]
+        if sort_key == 'size':
+            pool = sorted(pool, key=lambda s: -s.size)
+        elif sort_key == 'messages':
+            pool = sorted(pool, key=lambda s: -getattr(s, 'message_count', 0))
+        else:
+            pool = sorted(pool, key=lambda s: -s.date_created)
+        return pool
+
+    while True:
+        base_sessions = visible_base_sessions()
+        total_workspaces = len({s.workspace_dir for s in base_sessions if s.workspace_dir})
+        hidden_helper_count = sum(1 for s in all_sessions_full if getattr(s, 'is_empty_helper', False))
+        sessions = current_sessions()
+        print_menu_header(
+            workspace_filter, len(base_sessions), total_workspaces,
+            cwd_match, source_label="Kiro CLI", storage_path=KIRO_CLI_SESSIONS_DIR
+        )
+        if hidden_helper_count and not show_empty_helpers:
+            print(f"  {Style.DIM}Hidden CLI helper/subagent sessions: {hidden_helper_count}  "
+                  f"(press {Style.MAGENTA}e{Style.DIM} to show them){Style.RESET}\n")
+        elif hidden_helper_count:
+            print(f"  {Style.DIM}CLI helper/subagent sessions are visible: {hidden_helper_count}  "
+                  f"(press {Style.MAGENTA}e{Style.DIM} to hide them){Style.RESET}\n")
+        print_workspace_summary(base_sessions, workspace_filter, cwd_match, limit=6)
+
+        rendered_sessions = sessions[:view_limit]
+        list_sessions_table(
+            rendered_sessions,
+            show_workspace=(workspace_filter is None),
+            chain_graph=None,
+        )
+        if len(sessions) > view_limit:
+            print(f"{Style.DIM}(Showing {view_limit} of {len(sessions)} sessions — press M for more){Style.RESET}")
+
+        print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}")
+        print(f"  {Style.CYAN}[w]{Style.RESET}      : Switch directory  "
+              f"{Style.DIM}(or {Style.RESET}{Style.YELLOW}w1{Style.RESET}{Style.DIM}, {Style.RESET}{Style.YELLOW}w2{Style.RESET}{Style.DIM}, …  to jump directly){Style.RESET}")
+        print(f"  {Style.CYAN}[x]{Style.RESET}      : Show ALL directories (clear filter)")
+        print(f"  {Style.DIM}{'─' * 56}{Style.RESET}")
+        print(f"  {Style.GREEN}[ID, ID]{Style.RESET}: Convert specific CLI sessions (e.g. '1, 3')")
+        print(f"  {Style.YELLOW}[a]{Style.RESET}      : Convert ALL listed sessions")
+        print(f"  {Style.MAGENTA}[e]{Style.RESET}      : Toggle CLI helper/subagent sessions  "
+              f"({'SHOWING' if show_empty_helpers else 'HIDDEN'})")
+        print(f"  {Style.MAGENTA}[m]{Style.RESET}      : Show more rows (current: {view_limit})")
+        print(f"  {Style.MAGENTA}[s]{Style.RESET}      : Sort date / messages / size  (current: {sort_key})")
+        print(f"  {Style.MAGENTA}[r]{Style.RESET}      : Reload CLI session index")
+        print(f"  {Style.RED}[q]{Style.RESET}      : Quit")
+        choice = input(f"\n{Style.BOLD}Select > {Style.RESET}").strip().lower()
+
+        if choice == 'q':
+            print('Bye.'); sys.exit(0)
+        elif choice == 'w':
+            ws = select_workspace(base_sessions, workspace_filter)
+            workspace_filter = ws
+        elif re.fullmatch(r'w\d+', choice):
+            rows = workspace_summary(base_sessions)
+            n = int(choice[1:])
+            if 1 <= n <= len(rows):
+                workspace_filter = rows[n - 1][0]
+            else:
+                print(Style.error(f"No directory #{n} (have {len(rows)})."))
+                input(f"\n{Style.DIM}Press Enter to continue...{Style.RESET}")
+        elif choice == 'x':
+            workspace_filter = None
+        elif choice == 'r':
+            all_sessions_full = scan_cli_sessions()
+            cwd_match = detect_workspace_from_cwd(all_sessions_full)
+        elif choice == 'e':
+            show_empty_helpers = not show_empty_helpers
+        elif choice == 'm':
+            view_limit = min(view_limit + 15, 200)
+        elif choice == 's':
+            order = ['date', 'messages', 'size']
+            sort_key = order[(order.index(sort_key) + 1) % len(order)]
+        elif choice == 'a':
+            confirm = input(f"{Style.warn('Convert ALL listed CLI sessions? (y/n): ')}")
+            if confirm.lower() == 'y':
+                idx = ",".join([str(i+1) for i in range(len(rendered_sessions))])
+                process_conversion(
+                    idx, rendered_sessions,
+                    parser_cls=CliSessionParser,
+                    build_execution_index=False,
+                    allow_scope=False,
+                )
+        elif choice:
+            process_conversion(
+                choice, rendered_sessions,
+                parser_cls=CliSessionParser,
+                build_execution_index=False,
+                allow_scope=False,
+            )
+
+
+def select_session_source() -> str:
+    default_source = 'cli' if KIRO_CLI_SESSIONS_DIR.exists() else 'ide'
+    while True:
+        _clear_screen()
+        print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}choose session source{Style.RESET}\n")
+        ide_default = f" {Style.DIM}[Default]{Style.RESET}" if default_source == 'ide' else ''
+        cli_default = f" {Style.DIM}[Default]{Style.RESET}" if default_source == 'cli' else ''
+        print(f"  {Style.YELLOW}[1]{Style.RESET} Kiro IDE sessions{ide_default}")
+        print(f"      {Style.DIM}{WORKSPACE_SESSIONS_DIR}{Style.RESET}")
+        print(f"  {Style.YELLOW}[2]{Style.RESET} Kiro CLI sessions{cli_default}")
+        print(f"      {Style.DIM}{KIRO_CLI_SESSIONS_DIR}{Style.RESET}")
+        print(f"  {Style.YELLOW}[3]{Style.RESET} Find by session ID")
+        print(f"      {Style.DIM}Search IDE and CLI stores in parallel{Style.RESET}")
+        print(f"  {Style.RED}[q]{Style.RESET} Quit")
+        choice = input(f"\n{Style.BOLD}Select source > {Style.RESET}").strip().lower()
+        if not choice:
+            return default_source
+        if choice in ('1', 'i', 'ide', 'kiro ide'):
+            return 'ide'
+        if choice in ('2', 'c', 'cli', 'kiro cli'):
+            return 'cli'
+        if choice in ('3', 'f', 'find', 'id', 'session id'):
+            return 'find'
+        if choice == 'q':
+            print('Bye.'); sys.exit(0)
+
+
+def interactive_loop():
+    while True:
+        source = select_session_source()
+        if source == 'cli':
+            interactive_loop_cli()
+        elif source == 'find':
+            interactive_find_session_by_id()
+        else:
+            interactive_loop_ide()
 
 if __name__ == "__main__":
     try:
