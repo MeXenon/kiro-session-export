@@ -44,6 +44,8 @@ export with interactive controls.
 - **Session ID finder:** search both IDE and CLI stores in parallel by full
   session ID or prefix. If a match exists on both sides, the tool asks which one
   to export.
+- **Visible session IDs:** every session row shows its full ID, and the
+  workspace picker shows the latest session ID for each workspace.
 - **Workspace-aware browsing:** sessions are grouped by workspace/project
   directory. Running from inside a workspace auto-selects that workspace.
 - **CLI helper-session toggle:** Kiro CLI can create many subagent/helper
@@ -308,6 +310,12 @@ Expected matches should only be generic examples or platform storage references.
 ---
 
 ## Release Notes
+
+### [v1.2.1](https://github.com/MeXenon/kiro-session-export/releases/tag/v1.2.1)
+
+- Added full session IDs beneath every IDE and CLI session row.
+- Added each workspace's latest full session ID to the workspace picker.
+- Renamed the numeric selection column from `ID` to `#` to avoid ambiguity.
 
 ### [v1.2.0](https://github.com/MeXenon/kiro-session-export/releases/tag/v1.2.0)
 

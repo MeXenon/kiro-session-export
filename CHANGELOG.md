@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## v1.2.1 - 2026-06-21
+
+### Added
+
+- Full session IDs beneath every Kiro IDE and Kiro CLI session row.
+- The latest full session ID for each workspace in the workspace picker.
+
+### Changed
+
+- Renamed the numeric session-selection column from `ID` to `#` so it cannot be
+  confused with the actual Kiro session ID.
+
 ## v1.2.0 - 2026-06-13
 
 ### Added

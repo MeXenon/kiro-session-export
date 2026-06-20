@@ -3467,7 +3467,7 @@ def print_menu_header(workspace_filter: Optional[str], total_sessions: int,
                       source_label: str = "Kiro IDE",
                       storage_path: Optional[Path] = None):
     _clear_screen()
-    print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}v1.2 · {source_label}{Style.RESET}")
+    print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}v1.2.1 · {source_label}{Style.RESET}")
     print(f"{Style.DIM}Storage:   {storage_path or KIRO_HOME}{Style.RESET}")
     try:
         out = Path(__file__).parent.resolve()
@@ -3531,14 +3531,14 @@ def list_sessions_table(sessions: List[SessionEntry], show_workspace: bool = Tru
     marker_header = 'MSGS' if is_cli_table else 'BADGE'
     if show_workspace:
         if show_chain:
-            cols = ('ID', 4), ('DATE', 30), ('WORKSPACE', 18), ('TITLE', 24), ('CHAIN', 8), ('BADGE', 8), ('PREVIEW', 44), ('SIZE', 8)
+            cols = ('#', 4), ('DATE', 30), ('WORKSPACE', 18), ('TITLE', 24), ('CHAIN', 8), ('BADGE', 8), ('PREVIEW', 44), ('SIZE', 8)
         else:
-            cols = ('ID', 4), ('DATE', 30), ('WORKSPACE', 18), ('TITLE', 24), (marker_header, 8), ('PREVIEW', 53), ('SIZE', 8)
+            cols = ('#', 4), ('DATE', 30), ('WORKSPACE', 18), ('TITLE', 24), (marker_header, 8), ('PREVIEW', 53), ('SIZE', 8)
     else:
         if show_chain:
-            cols = ('ID', 4), ('DATE', 30), ('TITLE', 28), ('CHAIN', 8), ('BADGE', 8), ('PREVIEW', 56), ('SIZE', 8)
+            cols = ('#', 4), ('DATE', 30), ('TITLE', 28), ('CHAIN', 8), ('BADGE', 8), ('PREVIEW', 56), ('SIZE', 8)
         else:
-            cols = ('ID', 4), ('DATE', 30), ('TITLE', 28), (marker_header, 8), ('PREVIEW', 65), ('SIZE', 8)
+            cols = ('#', 4), ('DATE', 30), ('TITLE', 28), (marker_header, 8), ('PREVIEW', 65), ('SIZE', 8)
     header = ' '.join(f'{name:<{w}}' for name, w in cols)
     total_w = sum(w + 1 for _, w in cols) - 1
     print(f"{Style.BOLD}{header}{Style.RESET}")
@@ -3610,6 +3610,7 @@ def list_sessions_table(sessions: List[SessionEntry], show_workspace: bool = Tru
                 f"{(str(idx+1)+'  '):<4} {date_col:<30} {display_title:<28}{chain_part} {badge_col:<8} "
                 f"{Style.DIM}{preview:<{preview_w}}{Style.RESET}{row_color} {size_label:<8}{Style.RESET}"
             )
+        print(f"     {Style.DIM}Session ID:{Style.RESET} {Style.CYAN}{s.session_id}{Style.RESET}")
     print(f"{Style.DIM}{'-' * total_w}{Style.RESET}")
 
 def _norm_ws_path(p: str) -> str:
@@ -3765,6 +3766,7 @@ def list_chains_grouped(scoped_sessions: List[SessionEntry], all_sessions: List[
                 f"{Style.DIM}{preview:<42}{Style.RESET} "
                 f"{size_label}"
             )
+            print(f"        {Style.DIM}Session ID:{Style.RESET} {Style.CYAN}{s.session_id}{Style.RESET}")
             flat_ordered.append(s)
             next_id += 1
 
@@ -3804,6 +3806,7 @@ def list_chains_grouped(scoped_sessions: List[SessionEntry], all_sessions: List[
                         f"{Style.DIM}{preview:<42}{Style.RESET}{ws_label} "
                         f"{size_label}"
                     )
+                    print(f"        {Style.DIM}Session ID:{Style.RESET} {Style.CYAN}{s.session_id}{Style.RESET}")
                     flat_ordered.append(s)
                     next_id += 1
 
@@ -3814,10 +3817,10 @@ def select_workspace(all_sessions: List[SessionEntry], current: Optional[str] = 
     rows = workspace_summary(all_sessions)
     _clear_screen()
     print(f"\n  {Style.BOLD}{Style.HEADER}WORKSPACES{Style.RESET}  {Style.DIM}(sorted by most recent activity){Style.RESET}\n")
-    print(f"  {Style.DIM}{'-' * 92}{Style.RESET}")
-    print(f"  {Style.BOLD}{'ID':<4} {'LAST ACTIVITY':<32} {'SESS':<6} {'WORKSPACE'}{Style.RESET}")
-    print(f"  {Style.DIM}{'-' * 92}{Style.RESET}")
-    print(f"  {Style.YELLOW}[0]{Style.RESET}  {'all':<32} {len(all_sessions):<6} {Style.DIM}— all workspaces —{Style.RESET}")
+    print(f"  {Style.DIM}{'-' * 132}{Style.RESET}")
+    print(f"  {Style.BOLD}{'#':<4} {'LAST ACTIVITY':<32} {'SESS':<6} {'LATEST SESSION ID':<36} {'WORKSPACE'}{Style.RESET}")
+    print(f"  {Style.DIM}{'-' * 132}{Style.RESET}")
+    print(f"  {Style.YELLOW}[0]{Style.RESET}  {'all':<32} {len(all_sessions):<6} {'':<36} {Style.DIM}— all workspaces —{Style.RESET}")
     cwd_hit = detect_workspace_from_cwd(all_sessions)
     for i, (ws, lst, last_ms) in enumerate(rows):
         try:
@@ -3825,13 +3828,15 @@ def select_workspace(all_sessions: List[SessionEntry], current: Optional[str] = 
             when = dt.strftime('%Y-%m-%d %H:%M') + '  ' + format_relative_time(dt.timestamp())
         except Exception:
             when = '?'
+        latest = max(lst, key=lambda s: s.date_created or 0)
+        latest_sid = latest.session_id or '?'
         marker = ''
         if current and ws == current:
             marker = f' {Style.GREEN}● current{Style.RESET}'
         if ws == cwd_hit and cwd_hit != current:
             marker = f' {Style.CYAN}◆ matches cwd{Style.RESET}'
-        print(f"  {Style.YELLOW}[{i+1}]{Style.RESET}  {when:<32} {len(lst):<6} {ws}{marker}")
-    print(f"  {Style.DIM}{'-' * 92}{Style.RESET}")
+        print(f"  {Style.YELLOW}[{i+1}]{Style.RESET}  {when:<32} {len(lst):<6} {Style.CYAN}{latest_sid:<36}{Style.RESET} {ws}{marker}")
+    print(f"  {Style.DIM}{'-' * 132}{Style.RESET}")
     choice = input(f"\n  {Style.BOLD}Select workspace > {Style.RESET}").strip()
     if not choice or choice == '0':
         return None
