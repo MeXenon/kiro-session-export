@@ -3755,6 +3755,64 @@ def workspace_summary(all_sessions: List[SessionEntry]) -> List[Tuple[str, List[
     return rows
 
 
+def print_chain_session_line(num: int, lead: str, s: SessionEntry,
+                             show_workspace: bool = False,
+                             zebra: bool = False) -> None:
+    """One line for a session inside the chain view, sized to the terminal.
+
+    Shares the shape of the main list — identity and title on the left, dimmed
+    counters, age and full session ID trailing right — so switching views does
+    not mean re-learning the layout.
+    """
+    W = term_width()
+    flags = []
+    if s.from_compaction:
+        flags.append('↻')
+    if s.continuation_count:
+        flags.append(f'↪×{s.continuation_count}')
+    if s.hidden:
+        flags.append('hide')
+    dt = s.date
+    age = format_relative_time(dt.timestamp()).strip('()') if dt.year > 1970 else '--'
+    sid = s.session_id or '?'
+
+    num_s = f"{str(num) + ')':<5}"
+    lead_s = f"{lead:<12}"
+    ws_w = 0 if not show_workspace else (10 if W < 110 else 14)
+    ws_s = f"{_clip(short_workspace(s.workspace_dir), ws_w):<{ws_w}}  " if ws_w else ''
+    flags_s = f"{' '.join(flags):<5}"
+    size_s = f"{format_size(s.size):>9}"
+    age_s = f"{age:<12}"
+    short_id = sid[:8] + '…' if len(sid) > 9 else sid
+
+    # Drop the least useful column first until the title has room to breathe.
+    variants = [
+        f"{flags_s}  {size_s}  {age_s}  {sid}",
+        f"{flags_s}  {size_s}  {age_s}  {short_id}",
+        f"{size_s}  {age_s}  {short_id}",
+        f"{size_s}  {age_s}",
+        f"{size_s}",
+    ]
+    lead_len = 2 + len(num_s) + len(lead_s) + len(ws_s) + 2
+    tail = variants[-1]
+    title_w = 4
+    for candidate in variants:
+        room = W - lead_len - len(candidate)
+        if room >= 14:
+            tail, title_w = candidate, room
+            break
+    else:
+        tail = variants[-1]
+        title_w = max(0, W - lead_len - len(tail))
+
+    title_s = f"{_clip(s.display_title, title_w):<{title_w}}" if title_w else ''
+    bg = Style.BG_GRAY if zebra else ''
+    ws_styled = f"{Style.DIM}{ws_s}{Style.NORMAL}" if ws_s else ''
+    print(f"{bg}  {Style.YELLOW}{num_s}{Style.FG_RESET}"
+          f"{Style.DIM}{lead_s}{Style.NORMAL}{ws_styled}{title_s}  "
+          f"{Style.DIM}{tail}{Style.RESET}")
+
+
 def list_chains_grouped(scoped_sessions: List[SessionEntry], all_sessions: List[SessionEntry],
                         chain_graph: 'ChainGraph', show_workspace: bool = True,
                         show_hidden: bool = False,
@@ -3822,20 +3880,7 @@ def list_chains_grouped(scoped_sessions: List[SessionEntry], all_sessions: List[
         if len(t) > 100: t = t[:97] + '...'
         print(f"  {Style.DIM}└─ {t}{Style.RESET}")
 
-        for s in members:
-            s.load_preview()
-            dt = s.date
-            dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt.year > 1970 else '--'
-            rel_str = format_relative_time(dt.timestamp())
-            size_label = format_size(s.size)
-            title = s.display_title
-            preview = (s.preview_text or '')[:42]
-            badges = []
-            if s.from_compaction: badges.append('↻')
-            if s.continuation_count: badges.append(f'↪×{s.continuation_count}')
-            if s.hidden: badges.append('hide')
-            badge_str = ' '.join(badges)
-
+        for row_i, s in enumerate(members):
             pos = next((i+1 for i, x in enumerate(ch.sessions) if x.session_id == s.session_id), 0)
             conf_local = chain_graph.confidence_of.get(s.session_id, '-')
             if pos == 1:
@@ -3845,19 +3890,9 @@ def list_chains_grouped(scoped_sessions: List[SessionEntry], all_sessions: List[
             else:
                 tree = '├─'
             conf_mark_local = '✓' if conf_local == 'authoritative' else '~'
-            chain_pos = f'{tree} {pos:>2}/{ch.length}{conf_mark_local}'
-
-            id_label = f'{next_id:<3}'
-            print(
-                f"    {Style.YELLOW}{id_label}{Style.RESET} "
-                f"{Style.DIM}{chain_pos:<12}{Style.RESET} "
-                f"{title[:30]:<30} "
-                f"{Style.DIM}{badge_str:<10}{Style.RESET} "
-                f"{Style.DIM}{dt_str} {rel_str[:13]:<13}{Style.RESET} "
-                f"{Style.DIM}{preview:<42}{Style.RESET} "
-                f"{size_label}"
-            )
-            print(f"        {Style.DIM}Session ID:{Style.RESET} {Style.CYAN}{s.session_id}{Style.RESET}")
+            print_chain_session_line(
+                next_id, f'{tree} {pos:>2}/{ch.length}{conf_mark_local}', s,
+                show_workspace=show_workspace, zebra=bool(row_i % 2))
             flat_ordered.append(s)
             next_id += 1
 
@@ -3873,33 +3908,15 @@ def list_chains_grouped(scoped_sessions: List[SessionEntry], all_sessions: List[
         if visible_singletons:
             print()
             print(f"  {Style.BOLD}— Standalone sessions —{Style.RESET}  {Style.DIM}({len(visible_singletons)}){Style.RESET}")
+            row_i = 0
             for cid, members in visible_singletons:
                 for s in members:
-                    s.load_preview()
-                    dt = s.date
-                    dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt.year > 1970 else '--'
-                    rel_str = format_relative_time(dt.timestamp())
-                    size_label = format_size(s.size)
-                    title = s.display_title
-                    preview = (s.preview_text or '')[:42]
-                    badges = []
-                    if s.from_compaction: badges.append('↻')
-                    if s.continuation_count: badges.append(f'↪×{s.continuation_count}')
-                    if s.hidden: badges.append('hide')
-                    badge_str = ' '.join(badges)
-                    id_label = f'{next_id:<3}'
-                    ws_label = f' {Style.DIM}{short_workspace(s.workspace_dir):<16}{Style.RESET}' if show_workspace else ''
-                    print(
-                        f"    {Style.YELLOW}{id_label}{Style.RESET}             "
-                        f"{title[:30]:<30} "
-                        f"{Style.DIM}{badge_str:<10}{Style.RESET} "
-                        f"{Style.DIM}{dt_str} {rel_str[:13]:<13}{Style.RESET} "
-                        f"{Style.DIM}{preview:<42}{Style.RESET}{ws_label} "
-                        f"{size_label}"
-                    )
-                    print(f"        {Style.DIM}Session ID:{Style.RESET} {Style.CYAN}{s.session_id}{Style.RESET}")
+                    print_chain_session_line(next_id, '·', s,
+                                             show_workspace=show_workspace,
+                                             zebra=bool(row_i % 2))
                     flat_ordered.append(s)
                     next_id += 1
+                    row_i += 1
 
     return flat_ordered
 
