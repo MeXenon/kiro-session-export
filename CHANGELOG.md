@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## v1.2.2 - 2026-07-31
+
+### Fixed
+
+- Kiro CLI browsing no longer ignores the current workspace when `kiro-md.py`
+  sits in the directory it is run from. That is the normal case for the
+  documented quick start, and it silently disabled workspace auto-selection,
+  so every session from every workspace was listed at once.
+- Auto-selection from a parent directory is now unambiguous. Running from a
+  folder that contains several workspaces keeps the ALL view instead of
+  silently scoping to an arbitrary one.
+
+### Changed
+
+- The workspace recap collapses to a single line once a workspace is scoped,
+  since the header already shows its full path.
+
 ## v1.2.1 - 2026-06-21
 
 ### Added

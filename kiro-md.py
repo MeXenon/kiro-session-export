@@ -3467,7 +3467,7 @@ def print_menu_header(workspace_filter: Optional[str], total_sessions: int,
                       source_label: str = "Kiro IDE",
                       storage_path: Optional[Path] = None):
     _clear_screen()
-    print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}v1.2.1 · {source_label}{Style.RESET}")
+    print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}v1.2.2 · {source_label}{Style.RESET}")
     print(f"{Style.DIM}Storage:   {storage_path or KIRO_HOME}{Style.RESET}")
     try:
         out = Path(__file__).parent.resolve()
@@ -3492,16 +3492,35 @@ def print_workspace_summary(all_sessions: List[SessionEntry],
     rows = workspace_summary(all_sessions)
     if not rows:
         return
+
+    def _rel(ms: int) -> str:
+        try:
+            return format_relative_time(ms / 1000.0)
+        except Exception:
+            return ''
+
+    # Already scoped to one workspace: the header line above already shows the
+    # full path, so a 6-row recap is pure noise. Collapse to a single line.
+    if current:
+        cur = next(((i, r) for i, r in enumerate(rows, start=1) if r[0] == current), None)
+        if cur is not None:
+            i, (ws, lst, last_ms) = cur
+            mark = f'{Style.CYAN}◆{Style.RESET}' if ws == cwd_match else '●'
+            print(f"  {Style.BOLD}WORKSPACE{Style.RESET} {mark} "
+                  f"{len(lst)} sess  {Style.DIM}{_rel(last_ms)}{Style.RESET}  "
+                  f"{Style.BOLD}{short_workspace(ws)}{Style.RESET}   "
+                  f"{Style.DIM}·{Style.RESET}  {Style.YELLOW}[w]{Style.RESET} switch  "
+                  f"{Style.DIM}·{Style.RESET}  {Style.YELLOW}[x]{Style.RESET} show ALL "
+                  f"{Style.DIM}({len(rows)} workspaces){Style.RESET}\n")
+            return
+
     hint = (f"  {Style.YELLOW}[w]{Style.RESET} switch  ·  "
             f"{Style.YELLOW}[x]{Style.RESET} show ALL  ·  "
             f"{Style.YELLOW}[w<N>]{Style.RESET} jump to N")
     print(f"  {Style.BOLD}WORKSPACES{Style.RESET}  "
           f"{Style.DIM}({len(rows)} total){Style.RESET}  {hint}")
     for i, (ws, lst, last_ms) in enumerate(rows[:limit], start=1):
-        try:
-            rel = format_relative_time(last_ms / 1000.0)
-        except Exception:
-            rel = ''
+        rel = _rel(last_ms)
         short = short_workspace(ws)
         count = f'{len(lst):>3} sess'
         marks = []
@@ -3634,6 +3653,7 @@ def detect_workspace_from_cwd(all_sessions: List[SessionEntry]) -> Optional[str]
         return None
     workspaces = {s.workspace_dir for s in all_sessions if s.workspace_dir}
     best: Optional[Tuple[str, int]] = None
+    descendants: List[str] = []
     for ws in workspaces:
         wn = _norm_ws_path(ws)
         if not wn:
@@ -3641,17 +3661,22 @@ def detect_workspace_from_cwd(all_sessions: List[SessionEntry]) -> Optional[str]
         # Exact match
         if wn == cwd_norm:
             return ws
-        # cwd is inside the workspace
+        # cwd is inside the workspace — deepest (most specific) wins
         if cwd_norm.startswith(wn + '/'):
             depth = wn.count('/')
             if best is None or depth > best[1]:
                 best = (ws, depth)
-        # workspace is inside cwd (less common — e.g. a parent monorepo dir)
+        # workspace is inside cwd (e.g. cwd is a parent/monorepo dir)
         elif wn.startswith(cwd_norm + '/'):
-            depth = cwd_norm.count('/')
-            if best is None or depth > best[1]:
-                best = (ws, depth)
-    return best[0] if best else None
+            descendants.append(ws)
+    if best:
+        return best[0]
+    # Only auto-scope from a parent directory when it is unambiguous.
+    # Sitting in a folder that contains many workspaces (e.g. ~/Desktop/work)
+    # must NOT silently scope to an arbitrary one.
+    if len(descendants) == 1:
+        return descendants[0]
+    return None
 
 
 def workspace_summary(all_sessions: List[SessionEntry]) -> List[Tuple[str, List[SessionEntry], int]]:
@@ -4426,13 +4451,12 @@ def interactive_loop_cli():
     if not all_sessions_full:
         print(Style.error("No Kiro CLI sessions found.")); sys.exit(1)
 
+    # Auto-detect workspace from cwd (same behaviour as Kiro IDE mode).
+    # Note: the cwd being the script's own directory is the NORMAL case —
+    # the documented quick start downloads kiro-md.py into the project and
+    # runs it there — so it must not disable workspace scoping.
     cwd_match = detect_workspace_from_cwd(all_sessions_full)
-    try:
-        script_dir = Path(__file__).parent.resolve()
-        cwd_is_script_dir = _norm_ws_path(str(Path.cwd().resolve())) == _norm_ws_path(str(script_dir))
-    except Exception:
-        cwd_is_script_dir = False
-    workspace_filter: Optional[str] = cwd_match if (cwd_match and not cwd_is_script_dir) else None
+    workspace_filter: Optional[str] = cwd_match
     show_empty_helpers = False
     sort_key = 'date'
     view_limit = 15
