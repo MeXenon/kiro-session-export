@@ -64,6 +64,8 @@ class Style:
     DIM     = '\033[2m'
     REVERSE = '\033[7m'
     RESET   = '\033[0m'
+    NORMAL  = '\033[22m'      # cancels bold/dim, keeps background
+    FG_RESET = '\033[39m'     # cancels foreground colour, keeps background
     BG_GRAY = '\033[48;5;236m'
     BG_SELECTED = '\033[48;5;238m'
 
@@ -3467,170 +3469,202 @@ def print_menu_header(workspace_filter: Optional[str], total_sessions: int,
                       source_label: str = "Kiro IDE",
                       storage_path: Optional[Path] = None):
     _clear_screen()
-    print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}v1.2.2 · {source_label}{Style.RESET}")
+    print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}v1.2.3 · {source_label}{Style.RESET}")
     print(f"{Style.DIM}Storage:   {storage_path or KIRO_HOME}{Style.RESET}")
     try:
         out = Path(__file__).parent.resolve()
     except NameError:
         out = Path.cwd()
-    print(f"{Style.DIM}Output:    {out}{Style.RESET}")
-    if workspace_filter:
-        scope = workspace_filter
-        if cwd_match and cwd_match == workspace_filter:
-            scope += f"  {Style.CYAN}◆ auto-selected from cwd{Style.RESET}"
+    print(f"{Style.DIM}Output:    {out}{Style.RESET}\n")
+
+
+def print_scope_panel(all_sessions: List[SessionEntry],
+                      current: Optional[str], cwd_match: Optional[str],
+                      hidden_helpers: int = 0, showing_helpers: bool = False,
+                      limit: int = 5) -> None:
+    """Explain, in labelled lines, exactly what is on screen and what is not.
+
+    Three questions have to be answerable without thinking: where am I, why am
+    I seeing this many sessions, and how do I get to the others. A terse status
+    strip answers none of them, so each answer gets its own labelled line.
+    """
+    rows = workspace_summary(all_sessions)
+    total = len(all_sessions)
+    L = 11  # label column
+
+    def label(text: str) -> str:
+        return f"  {Style.BOLD}{text:<{L}}{Style.RESET}"
+
+    if current:
+        here = next((r for r in rows if r[0] == current), None)
+        n_here = len(here[1]) if here else 0
+        mark = f'{Style.CYAN}◆{Style.RESET} ' if current == cwd_match else ''
+        print(f"{label('HERE')}{mark}{Style.BOLD}{short_workspace(current)}{Style.RESET}"
+              f"{Style.DIM}  ·  {n_here} session{'s' if n_here != 1 else ''} "
+              f"in this directory only{Style.RESET}")
+        print(f"  {' ' * L}{Style.DIM}{current}{Style.RESET}")
+
+        others = [r for r in rows if r[0] != current]
+        other_sessions = sum(len(r[1]) for r in others)
+        if others:
+            print(f"{label('ELSEWHERE')}{Style.DIM}{len(others)} other director"
+                  f"{'ies' if len(others) != 1 else 'y'} hold {other_sessions} "
+                  f"more session{'s' if other_sessions != 1 else ''}{Style.RESET}")
+            print(f"  {' ' * L}{Style.YELLOW}[w]{Style.RESET} list every directory and switch"
+                  f"     {Style.YELLOW}[x]{Style.RESET} show sessions from all directories")
     else:
-        scope = f"ALL ({total_workspaces} workspaces, {total_sessions} sessions)"
-    print(f"{Style.DIM}Scope:     {Style.RESET}{scope}{Style.DIM}{Style.RESET}\n")
+        print(f"{label('SHOWING')}{Style.BOLD}every directory{Style.RESET}"
+              f"{Style.DIM}  ·  {total} session{'s' if total != 1 else ''} "
+              f"across {len(rows)} director{'ies' if len(rows) != 1 else 'y'}{Style.RESET}")
+        bits = []
+        for i, (ws, lst, _last) in enumerate(rows[:limit], start=1):
+            dot = f'{Style.CYAN}◆{Style.RESET}' if ws == cwd_match else ''
+            bits.append(f"{Style.YELLOW}w{i}{Style.RESET} {short_workspace(ws)}"
+                        f"{Style.DIM}·{len(lst)}{Style.RESET}{dot}")
+        strip = f"{Style.DIM}  {Style.RESET}".join(bits)
+        if len(rows) > limit:
+            strip += f"{Style.DIM}  +{len(rows) - limit} more{Style.RESET}"
+        print(f"{label('JUMP TO')}{strip}")
+        print(f"  {' ' * L}{Style.YELLOW}[w]{Style.RESET} list every directory and switch"
+              f"     {Style.YELLOW}[w1]{Style.RESET} jump straight to a numbered one")
+
+    if hidden_helpers:
+        if showing_helpers:
+            print(f"{label('INCLUDING')}{Style.DIM}{hidden_helpers} background helper session"
+                  f"{'s' if hidden_helpers != 1 else ''} — sub-agent runs, not your own chats"
+                  f"     {Style.MAGENTA}[e]{Style.DIM} hide them{Style.RESET}")
+        else:
+            print(f"{label('NOT SHOWN')}{Style.DIM}{hidden_helpers} background helper session"
+                  f"{'s' if hidden_helpers != 1 else ''} — sub-agent runs, not your own chats"
+                  f"     {Style.MAGENTA}[e]{Style.DIM} show them{Style.RESET}")
+    print()
 
 
 def print_workspace_summary(all_sessions: List[SessionEntry],
                             current: Optional[str], cwd_match: Optional[str],
                             limit: int = 6):
-    """Compact recap of workspaces at the top of the main screen.
-    Each row is numbered — typing the number is the same as pressing `w`
-    followed by that number, so workspace switching is one keypress away."""
-    rows = workspace_summary(all_sessions)
-    if not rows:
-        return
+    """Kept for callers that only need the directory recap."""
+    print_scope_panel(all_sessions, current, cwd_match, limit=limit)
 
-    def _rel(ms: int) -> str:
-        try:
-            return format_relative_time(ms / 1000.0)
-        except Exception:
-            return ''
+def term_width(default: int = 120) -> int:
+    """Usable terminal width, clamped to something a table can live in."""
+    import shutil as _sh
+    try:
+        return max(76, min(_sh.get_terminal_size((default, 30)).columns, 220))
+    except Exception:
+        return default
 
-    # Already scoped to one workspace: the header line above already shows the
-    # full path, so a 6-row recap is pure noise. Collapse to a single line.
-    if current:
-        cur = next(((i, r) for i, r in enumerate(rows, start=1) if r[0] == current), None)
-        if cur is not None:
-            i, (ws, lst, last_ms) = cur
-            mark = f'{Style.CYAN}◆{Style.RESET}' if ws == cwd_match else '●'
-            print(f"  {Style.BOLD}WORKSPACE{Style.RESET} {mark} "
-                  f"{len(lst)} sess  {Style.DIM}{_rel(last_ms)}{Style.RESET}  "
-                  f"{Style.BOLD}{short_workspace(ws)}{Style.RESET}   "
-                  f"{Style.DIM}·{Style.RESET}  {Style.YELLOW}[w]{Style.RESET} switch  "
-                  f"{Style.DIM}·{Style.RESET}  {Style.YELLOW}[x]{Style.RESET} show ALL "
-                  f"{Style.DIM}({len(rows)} workspaces){Style.RESET}\n")
-            return
 
-    hint = (f"  {Style.YELLOW}[w]{Style.RESET} switch  ·  "
-            f"{Style.YELLOW}[x]{Style.RESET} show ALL  ·  "
-            f"{Style.YELLOW}[w<N>]{Style.RESET} jump to N")
-    print(f"  {Style.BOLD}WORKSPACES{Style.RESET}  "
-          f"{Style.DIM}({len(rows)} total){Style.RESET}  {hint}")
-    for i, (ws, lst, last_ms) in enumerate(rows[:limit], start=1):
-        rel = _rel(last_ms)
-        short = short_workspace(ws)
-        count = f'{len(lst):>3} sess'
-        marks = []
-        if ws == current:
-            if ws == cwd_match:
-                marks.append('●◆')
-            else:
-                marks.append('●')
-            marker = ' '.join(marks) if marks else ' '
-            row = f"    w{i}  {marker:<2} {count}  {rel:<14} {short}"
-            print(f"{Style.BG_SELECTED}{Style.BOLD}{row}{Style.RESET}")
-            continue
-        if ws == cwd_match: marks.append(f'{Style.CYAN}◆{Style.RESET}')
-        marker = ' '.join(marks) if marks else ' '
-        num = f'{Style.YELLOW}w{i}{Style.RESET}'
-        row = f"    {num}  {marker:<2} {count}  {Style.DIM}{rel:<14}{Style.RESET} {short}"
-        print(row)
-    if len(rows) > limit:
-        print(f"          {Style.DIM}... and {len(rows) - limit} more — press {Style.YELLOW}w{Style.DIM} for full list{Style.RESET}")
-    print()
+def _clip(text: Optional[str], w: int) -> str:
+    """Trim to width with an ellipsis, never wider than `w`."""
+    t = (text or '').replace('\n', ' ').replace('\r', ' ').strip()
+    if w <= 0:
+        return ''
+    return t if len(t) <= w else t[:max(1, w - 1)] + '…'
+
 
 def list_sessions_table(sessions: List[SessionEntry], show_workspace: bool = True,
-                        chain_graph: Optional['ChainGraph'] = None):
-    # Column widths
+                        chain_graph: Optional['ChainGraph'] = None,
+                        show_preview: bool = False):
+    """One session per line, laid out to the width of the terminal.
+
+    Rows alternate a faint background instead of being separated by blank
+    lines, so each session still reads as its own block while twice as many
+    stay on screen. Identity and title sit on the left where the eye lands;
+    counters, size, age and the session ID trail off to the right, dimmed.
+    """
+    if not sessions:
+        return
     show_chain = chain_graph is not None
-    is_cli_table = any(hasattr(s, 'message_count') for s in sessions)
-    marker_header = 'MSGS' if is_cli_table else 'BADGE'
+    is_cli = any(hasattr(s, 'message_count') for s in sessions)
+    W = term_width()
+
+    # (header, width, align, flex) — flex columns share the leftover width.
+    spec: List[Tuple[str, int, str, bool]] = [('#', 3, '>', False)]
     if show_workspace:
-        if show_chain:
-            cols = ('#', 4), ('DATE', 30), ('WORKSPACE', 18), ('TITLE', 24), ('CHAIN', 8), ('BADGE', 8), ('PREVIEW', 44), ('SIZE', 8)
-        else:
-            cols = ('#', 4), ('DATE', 30), ('WORKSPACE', 18), ('TITLE', 24), (marker_header, 8), ('PREVIEW', 53), ('SIZE', 8)
-    else:
-        if show_chain:
-            cols = ('#', 4), ('DATE', 30), ('TITLE', 28), ('CHAIN', 8), ('BADGE', 8), ('PREVIEW', 56), ('SIZE', 8)
-        else:
-            cols = ('#', 4), ('DATE', 30), ('TITLE', 28), (marker_header, 8), ('PREVIEW', 65), ('SIZE', 8)
-    header = ' '.join(f'{name:<{w}}' for name, w in cols)
-    total_w = sum(w + 1 for _, w in cols) - 1
-    print(f"{Style.BOLD}{header}{Style.RESET}")
-    print(f"{Style.DIM}{'-' * total_w}{Style.RESET}")
+        spec.append(('DIRECTORY', 16, '<', False))
+    spec.append(('TITLE', 0, '<', True))
+    if show_preview:
+        spec.append(('FIRST MESSAGE', 0, '<', True))
+    if show_chain:
+        spec.append(('CHAIN', 9, '<', False))
+    spec.append((('MSGS', 5, '>') if is_cli else ('FLAGS', 8, '<')) + (False,))
+    spec.append(('SIZE', 9, '>', False))
+    spec.append(('AGE', 12, '<', False))
+    spec.append(('SESSION ID', 36, '<', False))
+    # Everything from AGE onwards is metadata and gets dimmed as one block.
+    tail_from = len(spec) - 2
+
+    def _flex_width(sp):
+        gaps = 2 * (len(sp) - 1)
+        fixed = sum(w for _, w, _, flex in sp if not flex)
+        n = sum(1 for *_, flex in sp if flex) or 1
+        return (W - 2 - fixed - gaps) // n
+
+    if _flex_width(spec) < 26:
+        # Titles matter more than the full UUID; keep a searchable prefix.
+        spec = [(h, 9 if h == 'SESSION ID' else w, a, f) for h, w, a, f in spec]
+    flex_w = max(14, _flex_width(spec))
+    widths = [flex_w if flex else w for _, w, _, flex in spec]
+    aligns = [a for _, _, a, _ in spec]
+
+    def compose(cells: List[str]) -> Tuple[str, str]:
+        padded = [f'{c:{a}{w}}'[:w] for c, a, w in zip(cells, aligns, widths)]
+        line = '  '.join(padded)
+        line = line[:W - 2].ljust(W - 2)
+        cut = sum(widths[:tail_from]) + 2 * tail_from
+        return line[:cut], line[cut:]
+
+    head, tail = compose([h for h, _, _, _ in spec])
+    print(f"  {Style.BOLD}{head}{Style.NORMAL}{Style.DIM}{tail}{Style.RESET}")
+
     for idx, s in enumerate(sessions):
-        s.load_preview()
-        dt = s.date
-        dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt.year > 1970 else '--'
-        rel_str = format_relative_time(dt.timestamp())
-        size_label = format_size(s.size)
-        title = s.display_title
+        if show_preview:
+            # Building a preview means opening and parsing the session file,
+            # so it is only paid for when the column is actually shown.
+            s.load_preview()
 
-        badges = []
+        flags = []
         if s.from_compaction:
-            badges.append('↻')
+            flags.append('↻')
         if s.continuation_count:
-            badges.append(f'↪×{s.continuation_count}')
+            flags.append(f'↪×{s.continuation_count}')
         if s.hidden:
-            badges.append('hide')
+            flags.append('hide')
         msg_count = getattr(s, 'message_count', 0)
-        if msg_count and not is_cli_table:
-            badges.append(f'{msg_count}m')
-        badge_str = str(msg_count) if is_cli_table and msg_count else (' '.join(badges) if badges else '')
+        if msg_count and not is_cli:
+            flags.append(f'{msg_count}m')
 
-        tag = ""
-        row_color = Style.RESET
-        if idx == 0:
-            tag = " [LATEST]"; row_color = Style.GREEN
-        elif idx < 3:
-            tag = " [NEW]"; row_color = Style.BLUE
-        elif idx % 2 == 0:
-            row_color = Style.CYAN
-
-        def fit(text, w):
-            text = (text or '')
-            return text if len(text) <= w else text[:max(1, w - 1)] + '…'
-
-        title_w = 24 if show_workspace else 28
-        preview_w = 44 if show_workspace else 56
-        if not show_chain:
-            preview_w += 9
-        display_title = fit(f"{title}{tag}", title_w)
-        preview = fit(s.preview_text or '', preview_w)
-        badge_col = fit(badge_str, 8)
-        date_col = f"{dt_str} {rel_str}"
-        date_col = fit(date_col, 30)
-
-        # Chain column
         chain_col = ''
         if chain_graph is not None:
             ch = chain_graph.chain_for(s.session_id)
             if ch and ch.length > 1:
-                pos = next((i+1 for i, x in enumerate(ch.sessions) if x.session_id == s.session_id), None)
-                conf_mark = '✓' if (chain_graph.confidence_of.get(s.session_id) == 'authoritative') else '~'
-                chain_col = f'{ch.id}·{pos}/{ch.length}{conf_mark}'
+                pos = next((i + 1 for i, x in enumerate(ch.sessions)
+                            if x.session_id == s.session_id), None)
+                mark = '✓' if chain_graph.confidence_of.get(s.session_id) == 'authoritative' else '~'
+                chain_col = f'{ch.id}·{pos}/{ch.length}{mark}'
 
+        dt = s.date
+        age = format_relative_time(dt.timestamp()).strip('()') if dt.year > 1970 else '--'
+
+        cells = [str(idx + 1)]
         if show_workspace:
-            ws_name = fit(short_workspace(s.workspace_dir), 18)
-            chain_part = f" {chain_col:<8}" if show_chain else ""
-            print(
-                f"{row_color}"
-                f"{(str(idx+1)+'  '):<4} {date_col:<30} {ws_name:<18} {display_title:<24}{chain_part} {badge_col:<8} "
-                f"{Style.DIM}{preview:<{preview_w}}{Style.RESET}{row_color} {size_label:<8}{Style.RESET}"
-            )
-        else:
-            chain_part = f" {chain_col:<8}" if show_chain else ""
-            print(
-                f"{row_color}"
-                f"{(str(idx+1)+'  '):<4} {date_col:<30} {display_title:<28}{chain_part} {badge_col:<8} "
-                f"{Style.DIM}{preview:<{preview_w}}{Style.RESET}{row_color} {size_label:<8}{Style.RESET}"
-            )
-        print(f"     {Style.DIM}Session ID:{Style.RESET} {Style.CYAN}{s.session_id}{Style.RESET}")
-    print(f"{Style.DIM}{'-' * total_w}{Style.RESET}")
+            cells.append(_clip(short_workspace(s.workspace_dir), widths[len(cells)]))
+        cells.append(_clip(s.display_title, flex_w))
+        if show_preview:
+            cells.append(_clip(s.preview_text, flex_w))
+        if show_chain:
+            cells.append(_clip(chain_col, 9))
+        cells.append(_clip(str(msg_count) if is_cli and msg_count else
+                           (' '.join(flags) if flags else '·'), widths[len(cells)]))
+        cells.append(format_size(s.size))
+        cells.append(_clip(age, 12))
+        cells.append(_clip(s.session_id or '?', widths[-1]))
+
+        head, tail = compose(cells)
+        bg = Style.BG_GRAY if idx % 2 else ''
+        accent = f'{Style.BOLD}{Style.GREEN}' if idx == 0 else ''
+        print(f"{bg}{accent}  {head}{Style.NORMAL}{Style.FG_RESET}{Style.DIM}{tail}{Style.RESET}")
 
 def _norm_ws_path(p: str) -> str:
     """Normalize a workspace path for cross-comparison (lowercase on Windows,
@@ -3641,42 +3675,74 @@ def _norm_ws_path(p: str) -> str:
     return q.lower() if _IS_WINDOWS else q
 
 
-def detect_workspace_from_cwd(all_sessions: List[SessionEntry]) -> Optional[str]:
-    """If the current working directory is *inside* one of the known
-    workspaces (or one of them is inside the cwd), pick that workspace."""
+def current_dir() -> str:
+    """The directory the tool was launched from, normalized for display."""
     try:
-        cwd = Path.cwd().resolve()
+        return str(Path.cwd().resolve())
     except Exception:
-        return None
-    cwd_norm = _norm_ws_path(str(cwd))
+        return str(Path.cwd())
+
+
+def detect_workspace_from_cwd(all_sessions: List[SessionEntry]) -> Optional[str]:
+    """Return the workspace whose path IS the current directory — nothing else.
+
+    Deliberately strict. Matching a parent directory instead would silently
+    show sessions belonging to some other project (every path under the home
+    directory has an ancestor workspace), which is indistinguishable from a
+    bug when you are sitting in a specific project and asked for its sessions.
+    Use `nearest_parent_workspace()` to *offer* a parent, never to auto-apply.
+    """
+    cwd_norm = _norm_ws_path(current_dir())
     if not cwd_norm:
         return None
-    workspaces = {s.workspace_dir for s in all_sessions if s.workspace_dir}
-    best: Optional[Tuple[str, int]] = None
-    descendants: List[str] = []
-    for ws in workspaces:
-        wn = _norm_ws_path(ws)
-        if not wn:
-            continue
-        # Exact match
-        if wn == cwd_norm:
+    for ws in {s.workspace_dir for s in all_sessions if s.workspace_dir}:
+        if _norm_ws_path(ws) == cwd_norm:
             return ws
-        # cwd is inside the workspace — deepest (most specific) wins
-        if cwd_norm.startswith(wn + '/'):
+    return None
+
+
+def nearest_parent_workspace(all_sessions: List[SessionEntry]) -> Optional[str]:
+    """Deepest workspace that *contains* the current directory, for hints only.
+    Never applied automatically — see detect_workspace_from_cwd()."""
+    cwd_norm = _norm_ws_path(current_dir())
+    if not cwd_norm:
+        return None
+    best: Optional[Tuple[str, int]] = None
+    for ws in {s.workspace_dir for s in all_sessions if s.workspace_dir}:
+        wn = _norm_ws_path(ws)
+        if wn and wn != cwd_norm and cwd_norm.startswith(wn + '/'):
             depth = wn.count('/')
             if best is None or depth > best[1]:
                 best = (ws, depth)
-        # workspace is inside cwd (e.g. cwd is a parent/monorepo dir)
-        elif wn.startswith(cwd_norm + '/'):
-            descendants.append(ws)
-    if best:
-        return best[0]
-    # Only auto-scope from a parent directory when it is unambiguous.
-    # Sitting in a folder that contains many workspaces (e.g. ~/Desktop/work)
-    # must NOT silently scope to an arbitrary one.
-    if len(descendants) == 1:
-        return descendants[0]
-    return None
+    return best[0] if best else None
+
+
+def print_no_sessions_here(cwd: str, all_sessions: List[SessionEntry],
+                           parent: Optional[str]) -> None:
+    """Shown when the current directory has no recorded sessions. Explicit is
+    better than silently listing another directory's sessions."""
+    rows = workspace_summary(all_sessions)
+    L = 11
+
+    def label(text: str) -> str:
+        return f"  {Style.BOLD}{text:<{L}}{Style.RESET}"
+
+    print(f"{label('HERE')}{Style.BOLD}{short_workspace(cwd)}{Style.RESET}"
+          f"{Style.DIM}  ·  no sessions were ever recorded in this directory{Style.RESET}")
+    print(f"  {' ' * L}{Style.DIM}{cwd}{Style.RESET}")
+    if parent:
+        n = len([s for s in all_sessions if s.workspace_dir == parent])
+        print(f"{label('NEARBY')}{Style.DIM}the parent directory {Style.RESET}"
+              f"{short_workspace(parent)}{Style.DIM} has {n} "
+              f"session{'s' if n != 1 else ''}{Style.RESET}")
+        print(f"  {' ' * L}{Style.DIM}{parent}{Style.RESET}")
+    total = len(all_sessions)
+    print(f"{label('ELSEWHERE')}{Style.DIM}{len(rows)} director"
+          f"{'ies' if len(rows) != 1 else 'y'} hold {total} "
+          f"session{'s' if total != 1 else ''} in total{Style.RESET}")
+    print(f"  {' ' * L}{Style.YELLOW}[w]{Style.RESET} list every directory and switch"
+          f"     {Style.YELLOW}[x]{Style.RESET} show sessions from all directories")
+    print()
 
 
 def workspace_summary(all_sessions: List[SessionEntry]) -> List[Tuple[str, List[SessionEntry], int]]:
@@ -3839,30 +3905,35 @@ def list_chains_grouped(scoped_sessions: List[SessionEntry], all_sessions: List[
 
 
 def select_workspace(all_sessions: List[SessionEntry], current: Optional[str] = None) -> Optional[str]:
+    """One line per directory: number, session count, age, name, then the path."""
     rows = workspace_summary(all_sessions)
-    _clear_screen()
-    print(f"\n  {Style.BOLD}{Style.HEADER}WORKSPACES{Style.RESET}  {Style.DIM}(sorted by most recent activity){Style.RESET}\n")
-    print(f"  {Style.DIM}{'-' * 132}{Style.RESET}")
-    print(f"  {Style.BOLD}{'#':<4} {'LAST ACTIVITY':<32} {'SESS':<6} {'LATEST SESSION ID':<36} {'WORKSPACE'}{Style.RESET}")
-    print(f"  {Style.DIM}{'-' * 132}{Style.RESET}")
-    print(f"  {Style.YELLOW}[0]{Style.RESET}  {'all':<32} {len(all_sessions):<6} {'':<36} {Style.DIM}— all workspaces —{Style.RESET}")
+    W = term_width()
     cwd_hit = detect_workspace_from_cwd(all_sessions)
-    for i, (ws, lst, last_ms) in enumerate(rows):
+    _clear_screen()
+    print(f"\n  {Style.BOLD}CHOOSE A DIRECTORY{Style.RESET}  "
+          f"{Style.DIM}{len(rows)} with sessions · most recent first{Style.RESET}\n")
+    name_w = max(14, min(28, max((len(short_workspace(ws)) for ws, _, _ in rows), default=14)))
+    path_w = max(20, W - (6 + 7 + 13 + name_w + 10))
+    print(f"  {Style.YELLOW}[0]{Style.RESET}  {Style.BOLD}{'every directory':<{name_w}}{Style.RESET}"
+          f"  {Style.DIM}{len(all_sessions)} sessions in total{Style.RESET}\n")
+    for i, (ws, lst, last_ms) in enumerate(rows, start=1):
         try:
-            dt = datetime.fromtimestamp(last_ms / 1000.0)
-            when = dt.strftime('%Y-%m-%d %H:%M') + '  ' + format_relative_time(dt.timestamp())
+            age = format_relative_time(last_ms / 1000.0).strip('()')
         except Exception:
-            when = '?'
-        latest = max(lst, key=lambda s: s.date_created or 0)
-        latest_sid = latest.session_id or '?'
-        marker = ''
+            age = '?'
         if current and ws == current:
-            marker = f' {Style.GREEN}● current{Style.RESET}'
-        if ws == cwd_hit and cwd_hit != current:
-            marker = f' {Style.CYAN}◆ matches cwd{Style.RESET}'
-        print(f"  {Style.YELLOW}[{i+1}]{Style.RESET}  {when:<32} {len(lst):<6} {Style.CYAN}{latest_sid:<36}{Style.RESET} {ws}{marker}")
-    print(f"  {Style.DIM}{'-' * 132}{Style.RESET}")
-    choice = input(f"\n  {Style.BOLD}Select workspace > {Style.RESET}").strip()
+            mark = f'{Style.GREEN}●{Style.RESET}'
+        elif ws == cwd_hit:
+            mark = f'{Style.CYAN}◆{Style.RESET}'
+        else:
+            mark = ' '
+        bg = Style.BG_GRAY if i % 2 == 0 else ''
+        print(f"  {bg}{Style.YELLOW}{f'[{i}]':<5}{Style.FG_RESET} {mark} "
+              f"{Style.DIM}{len(lst):>3} sess  {age:<12}{Style.NORMAL} "
+              f"{_clip(short_workspace(ws), name_w):<{name_w}}  "
+              f"{Style.DIM}{_clip(ws, path_w):<{path_w}}{Style.RESET}")
+    print(f"\n  {Style.DIM}● current   ◆ your directory   Enter or 0 = every directory{Style.RESET}")
+    choice = input(f"\n  {Style.BOLD}Directory > {Style.RESET}").strip()
     if not choice or choice == '0':
         return None
     if choice.isdigit() and 1 <= int(choice) <= len(rows):
@@ -4316,10 +4387,13 @@ def interactive_loop_ide():
 
     CHAIN_GRAPH = ChainGraph(all_sessions_full, EXEC_INDEX)
 
-    # Auto-detect workspace from cwd
+    # Scope to the launch directory — that exact directory and nothing else.
+    CWD = current_dir()
     cwd_match = detect_workspace_from_cwd(all_sessions_full)
-    workspace_filter: Optional[str] = cwd_match
+    cwd_parent = nearest_parent_workspace(all_sessions_full)
+    workspace_filter: Optional[str] = cwd_match or CWD
     show_hidden = False
+    show_preview = False
     sort_key = 'date'
     view_limit = 15
     chain_view = False
@@ -4339,35 +4413,42 @@ def interactive_loop_ide():
     while True:
         sessions = current_sessions()
         print_menu_header(workspace_filter, len(all_sessions_full), total_workspaces, cwd_match)
-        print_workspace_summary(all_sessions_full, workspace_filter, cwd_match, limit=6)
 
-        # Chain summary line
+        scoped_to_empty_cwd = (workspace_filter == CWD and cwd_match is None)
         multi_chains = [c for c in CHAIN_GRAPH.chains.values() if c.length > 1]
-        if multi_chains:
-            in_scope = [c for c in multi_chains if not workspace_filter or c.workspace == workspace_filter]
-            print(f"  {Style.BOLD}CHAINS{Style.RESET}  "
-                  f"{Style.DIM}({len(in_scope)} multi-session chain"
-                  f"{'s' if len(in_scope) != 1 else ''} in scope · view: "
-                  f"{'CHAIN-GROUPED' if chain_view else 'flat'} · toggle with C){Style.RESET}")
-
-        # Render listing
-        rendered_sessions = sessions[:view_limit]
-        if chain_view:
-            # In chain view, ignore view_limit per-chain — show entire chains
-            rendered_sessions = list_chains_grouped(
-                sessions, all_sessions_full, CHAIN_GRAPH,
-                show_workspace=(workspace_filter is None),
-                show_hidden=show_hidden,
-                workspace_filter=workspace_filter,
-            )
+        if scoped_to_empty_cwd:
+            print_no_sessions_here(CWD, all_sessions_full, cwd_parent)
+            rendered_sessions: List = []
         else:
-            list_sessions_table(
-                rendered_sessions,
-                show_workspace=(workspace_filter is None),
-                chain_graph=CHAIN_GRAPH,
-            )
-            if len(sessions) > view_limit:
-                print(f"{Style.DIM}(Showing {view_limit} of {len(sessions)} sessions — press M for more){Style.RESET}")
+            print_workspace_summary(all_sessions_full, workspace_filter, cwd_match, limit=6)
+
+            # Chain summary line
+            if multi_chains:
+                in_scope = [c for c in multi_chains if not workspace_filter or c.workspace == workspace_filter]
+                print(f"  {Style.BOLD}CHAINS{Style.RESET}  "
+                      f"{Style.DIM}({len(in_scope)} multi-session chain"
+                      f"{'s' if len(in_scope) != 1 else ''} in scope · view: "
+                      f"{'CHAIN-GROUPED' if chain_view else 'flat'} · toggle with C){Style.RESET}")
+
+            # Render listing
+            rendered_sessions = sessions[:view_limit]
+            if chain_view:
+                # In chain view, ignore view_limit per-chain — show entire chains
+                rendered_sessions = list_chains_grouped(
+                    sessions, all_sessions_full, CHAIN_GRAPH,
+                    show_workspace=(workspace_filter is None),
+                    show_hidden=show_hidden,
+                    workspace_filter=workspace_filter,
+                )
+            else:
+                list_sessions_table(
+                    rendered_sessions,
+                    show_workspace=(workspace_filter is None),
+                    chain_graph=CHAIN_GRAPH,
+                    show_preview=show_preview,
+                )
+                if len(sessions) > view_limit:
+                    print(f"{Style.DIM}(Showing {view_limit} of {len(sessions)} sessions — press M for more){Style.RESET}")
 
         print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}")
         # Workspace switching surfaced FIRST since it's how you find your sessions.
@@ -4383,6 +4464,8 @@ def interactive_loop_ide():
         show_h = 'ON' if show_hidden else 'OFF'
         print(f"  {Style.MAGENTA}[h]{Style.RESET}      : Toggle hidden sessions  ({show_h})")
         print(f"  {Style.MAGENTA}[m]{Style.RESET}      : Show more rows (current: {view_limit})")
+        print(f"  {Style.MAGENTA}[v]{Style.RESET}      : Toggle message preview column  "
+              f"({'ON' if show_preview else 'OFF'})")
         print(f"  {Style.MAGENTA}[s]{Style.RESET}      : Sort by size / date toggle  (current: {sort_key})")
         print(f"  {Style.MAGENTA}[r]{Style.RESET}      : Reload session index")
         print(f"  {Style.RED}[q]{Style.RESET}      : Quit")
@@ -4411,8 +4494,11 @@ def interactive_loop_ide():
             total_workspaces = len({s.workspace_dir for s in all_sessions_full if s.workspace_dir})
             CHAIN_GRAPH = ChainGraph(all_sessions_full, EXEC_INDEX)
             cwd_match = detect_workspace_from_cwd(all_sessions_full)
+            cwd_parent = nearest_parent_workspace(all_sessions_full)
         elif choice == 'h':
             show_hidden = not show_hidden
+        elif choice == 'v':
+            show_preview = not show_preview
         elif choice == 'm':
             view_limit = min(view_limit + 15, 200)
         elif choice == 's':
@@ -4451,13 +4537,14 @@ def interactive_loop_cli():
     if not all_sessions_full:
         print(Style.error("No Kiro CLI sessions found.")); sys.exit(1)
 
-    # Auto-detect workspace from cwd (same behaviour as Kiro IDE mode).
-    # Note: the cwd being the script's own directory is the NORMAL case —
-    # the documented quick start downloads kiro-md.py into the project and
-    # runs it there — so it must not disable workspace scoping.
+    # Scope to the directory we were launched from — that exact directory and
+    # nothing else. A parent workspace is only ever offered, never applied.
+    CWD = current_dir()
     cwd_match = detect_workspace_from_cwd(all_sessions_full)
-    workspace_filter: Optional[str] = cwd_match
+    cwd_parent = nearest_parent_workspace(all_sessions_full)
+    workspace_filter: Optional[str] = cwd_match or CWD
     show_empty_helpers = False
+    show_preview = False
     sort_key = 'date'
     view_limit = 15
 
@@ -4487,22 +4574,26 @@ def interactive_loop_cli():
             workspace_filter, len(base_sessions), total_workspaces,
             cwd_match, source_label="Kiro CLI", storage_path=KIRO_CLI_SESSIONS_DIR
         )
-        if hidden_helper_count and not show_empty_helpers:
-            print(f"  {Style.DIM}Hidden CLI helper/subagent sessions: {hidden_helper_count}  "
-                  f"(press {Style.MAGENTA}e{Style.DIM} to show them){Style.RESET}\n")
-        elif hidden_helper_count:
-            print(f"  {Style.DIM}CLI helper/subagent sessions are visible: {hidden_helper_count}  "
-                  f"(press {Style.MAGENTA}e{Style.DIM} to hide them){Style.RESET}\n")
-        print_workspace_summary(base_sessions, workspace_filter, cwd_match, limit=6)
+        # Scoped to the launch directory, and that directory has nothing.
+        # Say so plainly instead of drifting to some other directory.
+        scoped_to_empty_cwd = (workspace_filter == CWD and cwd_match is None)
+        if scoped_to_empty_cwd:
+            print_no_sessions_here(CWD, base_sessions, cwd_parent)
+            rendered_sessions: List = []
+        else:
+            print_scope_panel(base_sessions, workspace_filter, cwd_match,
+                              hidden_helpers=hidden_helper_count,
+                              showing_helpers=show_empty_helpers, limit=5)
 
-        rendered_sessions = sessions[:view_limit]
-        list_sessions_table(
-            rendered_sessions,
-            show_workspace=(workspace_filter is None),
-            chain_graph=None,
-        )
-        if len(sessions) > view_limit:
-            print(f"{Style.DIM}(Showing {view_limit} of {len(sessions)} sessions — press M for more){Style.RESET}")
+            rendered_sessions = sessions[:view_limit]
+            list_sessions_table(
+                rendered_sessions,
+                show_workspace=(workspace_filter is None),
+                chain_graph=None,
+                show_preview=show_preview,
+            )
+            if len(sessions) > view_limit:
+                print(f"{Style.DIM}(Showing {view_limit} of {len(sessions)} sessions — press M for more){Style.RESET}")
 
         print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}")
         print(f"  {Style.CYAN}[w]{Style.RESET}      : Switch directory  "
@@ -4514,6 +4605,8 @@ def interactive_loop_cli():
         print(f"  {Style.MAGENTA}[e]{Style.RESET}      : Toggle CLI helper/subagent sessions  "
               f"({'SHOWING' if show_empty_helpers else 'HIDDEN'})")
         print(f"  {Style.MAGENTA}[m]{Style.RESET}      : Show more rows (current: {view_limit})")
+        print(f"  {Style.MAGENTA}[v]{Style.RESET}      : Toggle message preview column  "
+              f"({'ON' if show_preview else 'OFF'})")
         print(f"  {Style.MAGENTA}[s]{Style.RESET}      : Sort date / messages / size  (current: {sort_key})")
         print(f"  {Style.MAGENTA}[r]{Style.RESET}      : Reload CLI session index")
         print(f"  {Style.RED}[q]{Style.RESET}      : Quit")
@@ -4537,8 +4630,11 @@ def interactive_loop_cli():
         elif choice == 'r':
             all_sessions_full = scan_cli_sessions()
             cwd_match = detect_workspace_from_cwd(all_sessions_full)
+            cwd_parent = nearest_parent_workspace(all_sessions_full)
         elif choice == 'e':
             show_empty_helpers = not show_empty_helpers
+        elif choice == 'v':
+            show_preview = not show_preview
         elif choice == 'm':
             view_limit = min(view_limit + 15, 200)
         elif choice == 's':

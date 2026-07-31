@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## v1.2.3 - 2026-07-31
+
+### Fixed
+
+- Browsing no longer falls back to a *different* directory's sessions. Because
+  the home directory itself can be a recorded workspace, any folder without its
+  own sessions used to silently scope to an ancestor — marking that other
+  directory as the current one and listing sessions from unrelated projects.
+  The current directory is now matched exactly, or not at all.
+
+### Added
+
+- A clear state for directories with no recorded sessions: the directory is
+  named, the nearest recorded parent is offered, and switching or showing every
+  directory is one keypress away.
+- `[v]` toggles the message-preview column.
+
+### Changed
+
+- One line per session. The session ID no longer takes a second line, rows
+  alternate a faint background instead of being fenced by dashes, and the
+  layout is measured against the real terminal width — the title takes
+  whatever space is left and the ID shortens only when it has to.
+- The directory picker is one line per directory: number, session count, age,
+  name, path. The latest-session-ID column and the 132-character rules are gone.
+- When no directory is scoped, the recap is a single inline strip of the busiest
+  directories rather than a six-row block.
+- The preview column is off by default; the title carries the row. Its width
+  goes to the title instead, and session files are no longer opened and parsed
+  to build previews that are not displayed.
+
 ## v1.2.2 - 2026-07-31
 
 ### Fixed
