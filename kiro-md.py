@@ -32,6 +32,7 @@ import glob
 import re
 import base64
 import hashlib
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set, Iterable
@@ -158,6 +159,7 @@ SECTION_DEFS = [
     ('web_fetch',        'Web Fetches',         '🔗', False),
     ('mcp_tool',         'MCP Calls',           '🔌', False),
     ('sub_agent',        'Sub-Agent Calls',     '🧩', True ),
+    ('orchestration',    'Orchestrations',      '🎭', True ),
     ('summarization',    'Compaction Summary',  '✂️ ', True ),
     ('intent',           'Intent Classification','🎯', False),
     ('error',            'Errors',              '❗', False),
@@ -374,15 +376,62 @@ class ExecutionIndex:
         br'\s*:\s*(?:"([^"]*)"|(\d+)|\[([^\]]*)\])'
     )
 
+    # The top-level chatSessionId is the value beside autonomyMode, after the
+    # input. A continuation's input quotes an older chatSessionId first, and
+    # that nested copy is the ancestor, not this session. parentSessionIds,
+    # when present, is in the last kilobyte. The read stops at the real id
+    # and still skips the action transcript after it.
+    _META_HEAD_START = 4096
+    _META_HEAD_CAP = 3 * 1024 * 1024
+    _META_PARENT_CAP = 8 * 1024 * 1024
+    _META_HEAD_STEP = 256 * 1024
+    _META_TAIL = 16 * 1024
+    _SESSION_PAIR_RE = re.compile(
+        br'"autonomyMode"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"chatSessionId"\s*:\s*"([^"]*)"'
+    )
+
+    @staticmethod
+    def _read_meta_bytes(fp: Path) -> Optional[bytes]:
+        try:
+            with open(fp, 'rb') as fh:
+                head = fh.read(ExecutionIndex._META_HEAD_START)
+                if b'"executionId"' not in head:
+                    return None
+                end = fh.seek(0, os.SEEK_END)
+                tail = b''
+                if end > len(head):
+                    fh.seek(max(0, end - ExecutionIndex._META_TAIL))
+                    tail = fh.read(ExecutionIndex._META_TAIL)
+                    fh.seek(len(head))
+                # A record that names parents has already quoted the ancestor
+                # id inside the input. Keep reading until the real id.
+                parented = b'"parentSessionIds"' in head or b'"parentSessionIds"' in tail
+                if parented:
+                    cap = ExecutionIndex._META_PARENT_CAP
+                    while (ExecutionIndex._SESSION_PAIR_RE.search(head) is None
+                           and len(head) < cap):
+                        more = fh.read(ExecutionIndex._META_HEAD_STEP)
+                        if not more:
+                            break
+                        head += more
+                else:
+                    while (b'"chatSessionId"' not in head
+                           and len(head) < ExecutionIndex._META_HEAD_CAP):
+                        more = fh.read(ExecutionIndex._META_HEAD_STEP)
+                        if not more:
+                            break
+                        head += more
+        except Exception:
+            return None
+        if end <= len(head):
+            return head
+        return head + b'\n' + tail
+
     @staticmethod
     def _scan_meta(fp: Path) -> Optional[Dict]:
-        """Extract metadata fields with a single regex pass over the file
-        bytes — avoids constructing the full Python tree for multi-MB
-        execution records."""
-        try:
-            with open(fp, 'rb') as f:
-                data = f.read()
-        except Exception:
+        """Extract execution metadata without reading the whole transcript."""
+        data = ExecutionIndex._read_meta_bytes(fp)
+        if not data:
             return None
         out: Dict[str, Optional[object]] = {
             'executionId': None, 'chatSessionId': None,
@@ -408,6 +457,11 @@ class ExecutionIndex:
                         m2.decode('utf-8', 'replace')
                         for m2 in re.findall(br'"([^"]+)"', aval)
                     ]
+        # The first chatSessionId in a continuation is the ancestor quoted
+        # inside the input. The field beside autonomyMode is this session.
+        pair = ExecutionIndex._SESSION_PAIR_RE.search(data)
+        if pair:
+            out['chatSessionId'] = pair.group(1).decode('utf-8', 'replace')
         return out
 
     def build(self, progress: bool = False):
@@ -430,11 +484,9 @@ class ExecutionIndex:
             sys.stdout.write(f"{Style.DIM}Reading {len(files)} execution records...{Style.RESET}\n")
             sys.stdout.flush()
 
-        # Scan files in parallel. Each worker reads its file bytes and runs
-        # the combined-regex meta extraction — disk IO overlaps across
-        # workers and json/orjson aren't even needed at this stage.
+        # Each worker reads only the metadata slices, not the transcript.
         from concurrent.futures import ThreadPoolExecutor
-        workers = min(8, max(2, len(files)))
+        workers = min(16, max(2, len(files)))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             metas = list(ex.map(self._scan_meta, files))
 
@@ -866,9 +918,9 @@ class CliSessionEntry:
                  'updated_ms', 'created_at', 'updated_at', 'workspace_dir',
                  'hidden', 'session_file', 'workspace_b64',
                  'continuation_count', 'message_count', 'turn_count',
-                 'session_created_reason', '_preview_first_user',
-                 '_preview_from_compaction', '_preview_summary_heading',
-                 '_preview_loaded')
+                 'session_created_reason', 'parent_session_id',
+                 '_preview_first_user', '_preview_from_compaction',
+                 '_preview_summary_heading', '_preview_loaded')
 
     def __init__(self, sid: str, title: str, created_ms: int, updated_ms: int,
                  created_at: str, updated_at: str, cwd: str, session_file: Path,
@@ -890,6 +942,7 @@ class CliSessionEntry:
         self.message_count = int(message_count or 0)
         self.turn_count = int(turn_count or 0)
         self.session_created_reason = reason or ""
+        self.parent_session_id = ""
         self._preview_first_user: Optional[str] = None
         self._preview_summary_heading: Optional[str] = None
         self._preview_from_compaction = False
@@ -936,11 +989,25 @@ class CliSessionEntry:
 
     @property
     def is_empty_helper(self) -> bool:
-        return (
+        # A stage session always names the crew that launched it. Those are
+        # not the user's chats, even after Kiro writes a turn into the index.
+        if self.parent_session_id:
+            return True
+        if not (
             self.session_created_reason == 'subagent'
             and self.message_count == 0
             and self.turn_count == 0
-        )
+        ):
+            return False
+        # A chat that is still open can have an empty index while the jsonl
+        # already holds the prompt. A stage names its parent above, so a
+        # parentless transcript is one of the user's own chats.
+        try:
+            if self.session_file.with_suffix('.jsonl').stat().st_size > 0:
+                return False
+        except OSError:
+            pass
+        return True
 
     @property
     def date(self) -> datetime:
@@ -971,54 +1038,95 @@ class CliSessionEntry:
         return total
 
 
-def scan_cli_sessions() -> List[CliSessionEntry]:
-    """Read every Kiro CLI session JSON and return browser-ready entries."""
-    sessions: List[CliSessionEntry] = []
-    if not KIRO_CLI_SESSIONS_DIR.exists():
-        return sessions
-    for fp in KIRO_CLI_SESSIONS_DIR.glob("*.json"):
-        if not fp.is_file():
-            continue
+def _cli_session_from_json(fp: Path, data: Dict) -> CliSessionEntry:
+    turns = (((data.get('session_state') or {})
+              .get('conversation_metadata') or {})
+             .get('user_turn_metadatas') or [])
+    if not isinstance(turns, list):
+        turns = []
+    message_count = 0
+    for turn in turns:
+        ids = turn.get('message_ids') if isinstance(turn, dict) else None
+        if isinstance(ids, list):
+            message_count += len(ids)
+    if not message_count:
+        message_count = len(turns)
+    created_at = data.get('created_at') or ''
+    updated_at = data.get('updated_at') or ''
+    created_ms = parse_iso_datetime_ms(created_at)
+    updated_ms = parse_iso_datetime_ms(updated_at)
+    if not updated_ms:
         try:
-            data = _json_load_path(fp)
+            updated_ms = int(fp.stat().st_mtime * 1000)
         except Exception:
+            updated_ms = created_ms
+    entry = CliSessionEntry(
+        sid=data.get('session_id') or fp.stem,
+        title=data.get('title') or '',
+        created_ms=created_ms,
+        updated_ms=updated_ms,
+        created_at=created_at,
+        updated_at=updated_at,
+        cwd=data.get('cwd') or '',
+        session_file=fp,
+        message_count=message_count,
+        turn_count=len(turns),
+        reason=data.get('session_created_reason') or '',
+    )
+    entry.parent_session_id = data.get('parent_session_id') or ''
+    return entry
+
+
+def _parse_cli_session_file(fp: Path) -> Optional[CliSessionEntry]:
+    try:
+        data = _json_load_path(fp)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _cli_session_from_json(fp, data)
+
+
+def _cli_json_paths(id_query: str = '') -> List[Path]:
+    """JSON indexes in the CLI session directory.
+
+    `id_query` limits the list to filenames that are that session id or,
+    when it is at least 8 characters, start with it. The filename is the id,
+    so a lookup does not have to parse every other session.
+    """
+    if not KIRO_CLI_SESSIONS_DIR.exists():
+        return []
+    query = (id_query or '').strip().lower()
+    paths: List[Path] = []
+    try:
+        entries = list(os.scandir(KIRO_CLI_SESSIONS_DIR))
+    except OSError:
+        return []
+    for entry in entries:
+        name = entry.name
+        if not name.endswith('.json'):
             continue
-        if not isinstance(data, dict):
-            continue
-        turns = (((data.get('session_state') or {})
-                  .get('conversation_metadata') or {})
-                 .get('user_turn_metadatas') or [])
-        if not isinstance(turns, list):
-            turns = []
-        message_count = 0
-        for turn in turns:
-            ids = turn.get('message_ids') if isinstance(turn, dict) else None
-            if isinstance(ids, list):
-                message_count += len(ids)
-        if not message_count:
-            message_count = len(turns)
-        created_at = data.get('created_at') or ''
-        updated_at = data.get('updated_at') or ''
-        created_ms = parse_iso_datetime_ms(created_at)
-        updated_ms = parse_iso_datetime_ms(updated_at)
-        if not updated_ms:
-            try:
-                updated_ms = int(fp.stat().st_mtime * 1000)
-            except Exception:
-                updated_ms = created_ms
-        sessions.append(CliSessionEntry(
-            sid=data.get('session_id') or fp.stem,
-            title=data.get('title') or '',
-            created_ms=created_ms,
-            updated_ms=updated_ms,
-            created_at=created_at,
-            updated_at=updated_at,
-            cwd=data.get('cwd') or '',
-            session_file=fp,
-            message_count=message_count,
-            turn_count=len(turns),
-            reason=data.get('session_created_reason') or '',
-        ))
+        stem = name[:-5]
+        if query:
+            stem_l = stem.lower()
+            if stem_l != query and not (len(query) >= 8 and stem_l.startswith(query)):
+                continue
+        paths.append(Path(entry.path))
+    return paths
+
+
+def scan_cli_sessions(id_query: str = '') -> List[CliSessionEntry]:
+    """Read Kiro CLI session indexes and return browser-ready entries."""
+    paths = _cli_json_paths(id_query)
+    if not paths:
+        return []
+    from concurrent.futures import ThreadPoolExecutor
+    workers = min(32, max(1, len(paths)))
+    sessions: List[CliSessionEntry] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for entry in pool.map(_parse_cli_session_file, paths, chunksize=32):
+            if entry is not None:
+                sessions.append(entry)
     sessions.sort(key=lambda s: s.date_created, reverse=True)
     return sessions
 
@@ -1724,9 +1832,12 @@ class SessionParser:
                     user_cap: int = 0,
                     agent_cap: int = 0,
                     reasoning_cap: int = 0,
-                    summary_cap: int = 0) -> str:
+                    summary_cap: int = 0,
+                    orch_filter: Optional[Dict] = None) -> str:
         if section_filter is None:
             section_filter = {s[0]: True for s in SECTION_DEFS}
+        if orch_filter is None:
+            orch_filter = default_orch_filter()
 
         def _cap_text(text: str, cap: int = 0) -> str:
             c = cap if cap > 0 else output_cap
@@ -2016,6 +2127,14 @@ class SessionParser:
                     md.append(f"\n**Response:**\n\n```text\n{_cap_text(resp)}\n```")
                 md.append('')
 
+            elif t == 'orchestration':
+                heavy = None
+                if any((orch_filter.get('layers') or {}).get(key) for key in ORCH_HEAVY_LAYERS):
+                    heavy = load_orchestration_heavy(item, orch_filter, output_cap)
+                block = render_orchestration(item, orch_filter, output_cap, heavy)
+                if block.strip():
+                    md.append(block)
+
             elif t == 'sub_agent':
                 kind = item.get('kind', '')
                 if kind == 'invoke':
@@ -2093,6 +2212,7 @@ class CliSessionParser:
         self.credits_used = 0.0
         self._pending_tool_uses: Dict[str, Dict] = {}
         self._pending_item_idx: Dict[str, int] = {}
+        self._orch_turn = 0
 
         self._load()
 
@@ -2172,7 +2292,11 @@ class CliSessionParser:
 
     @staticmethod
     def _builtin_tool(result_obj) -> Tuple[str, Dict, str]:
-        tool = (result_obj or {}).get('tool') or {}
+        if not isinstance(result_obj, dict):
+            return '', {}, ''
+        tool = result_obj.get('tool') or {}
+        if not isinstance(tool, dict):
+            return '', {}, ''
         purpose = tool.get('tool_use_purpose') or ''
         kind = tool.get('kind') or {}
         if isinstance(kind, dict) and isinstance(kind.get('BuiltIn'), dict):
@@ -2185,7 +2309,11 @@ class CliSessionParser:
 
     @staticmethod
     def _mcp_tool(result_obj) -> Tuple[str, str, Dict, str]:
-        tool = (result_obj or {}).get('tool') or {}
+        if not isinstance(result_obj, dict):
+            return '', '', {}, ''
+        tool = result_obj.get('tool') or {}
+        if not isinstance(tool, dict):
+            return '', '', {}, ''
         purpose = tool.get('tool_use_purpose') or ''
         kind = tool.get('kind') or {}
         if isinstance(kind, dict) and isinstance(kind.get('Mcp'), dict):
@@ -2200,7 +2328,11 @@ class CliSessionParser:
 
     @classmethod
     def _result_payload(cls, result_obj) -> Tuple[str, List[Dict], str]:
-        result = (result_obj or {}).get('result') or {}
+        if isinstance(result_obj, str):
+            result_obj = {'result': result_obj}
+        elif not isinstance(result_obj, dict):
+            return '', [], ''
+        result = result_obj.get('result') or {}
         if isinstance(result, dict) and isinstance(result.get('Success'), dict):
             items = result.get('Success', {}).get('items') or []
             return 'Success', items, ''
@@ -2370,20 +2502,27 @@ class CliSessionParser:
         prompt_count = 0
         assistant_count = 0
         line_count = 0
-        with open(jsonl_path, 'r', encoding='utf-8') as f:
+        self._orch_turn = 0
+        with open(jsonl_path, 'rb') as f:
             for line_count, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    obj = json.loads(line)
+                    obj = _orjson.loads(line) if _orjson is not None else json.loads(line)
                 except Exception:
+                    continue
+                if not isinstance(obj, dict):
                     continue
                 kind = obj.get('kind')
                 data = obj.get('data') or {}
+                if not isinstance(data, dict):
+                    continue
                 if kind == 'Prompt':
                     prompt_count += 1
-                    content = msg_text(data.get('content') or [])
+                    self._orch_turn = prompt_count
+                    raw_content = data.get('content')
+                    content = msg_text(raw_content if isinstance(raw_content, (str, list)) else [])
                     if content.strip():
                         self._append_item({
                             'type': 'user_message',
@@ -2393,14 +2532,19 @@ class CliSessionParser:
                         })
                 elif kind == 'AssistantMessage':
                     assistant_count += 1
+                    blocks = data.get('content')
+                    if not isinstance(blocks, list):
+                        blocks = []
                     self._append_cli_message_blocks(
-                        data.get('content') or [],
+                        blocks,
                         data.get('message_id') or f"cli-assistant-{assistant_count}",
                         role='assistant',
                     )
                 elif kind == 'ToolResults':
-                    for tool_use_id, result_obj in (data.get('results') or {}).items():
-                        self._append_tool_result(tool_use_id, result_obj)
+                    results = data.get('results') or {}
+                    if isinstance(results, dict):
+                        for tool_use_id, result_obj in results.items():
+                            self._append_tool_result(tool_use_id, result_obj)
                 elif kind == 'Compaction':
                     summary = data.get('summary') or data.get('content') or self._json_text(data)
                     self.compaction_count += 1
@@ -2425,6 +2569,15 @@ class CliSessionParser:
                     })
         self.user_turn_count = prompt_count or self.entry.turn_count
         self.metadata['jsonl_events'] = line_count
+        crew_count = sum(1 for item in self.data if item.get('type') == 'orchestration')
+        if crew_count:
+            print(Style.info(f"Linking stages across {crew_count} orchestration(s)..."))
+            enrich_orchestrations(self)
+            linked = sum(
+                1 for item in self.data if item.get('type') == 'orchestration'
+                for stage in item.get('stages') or [] if stage.get('session_id')
+            )
+            print(Style.info(f"Linked {linked} stage session(s)."))
         if not self.data and self.title:
             self._append_item({
                 'type': 'user_message',
@@ -2433,7 +2586,9 @@ class CliSessionParser:
             })
 
     def _append_cli_message_blocks(self, blocks, execution_id: str, role: str = 'assistant'):
-        for block in blocks or []:
+        if not isinstance(blocks, list):
+            return
+        for block in blocks:
             if not isinstance(block, dict):
                 continue
             kind = block.get('kind')
@@ -2472,7 +2627,83 @@ class CliSessionParser:
                     'execution_id': execution_id,
                 })
 
+    def _append_orchestration(self, args: Dict, purpose: str, execution_id: str):
+        """Record a crew at the moment the lead agent launches it."""
+        specs = []
+        for stage in args.get('stages') or []:
+            if not isinstance(stage, dict):
+                continue
+            specs.append({
+                'name': stage.get('name') or '(unnamed)',
+                'role': stage.get('role') or '',
+                'model': stage.get('model') or '',
+                'brief': stage.get('prompt_template') or stage.get('prompt') or '',
+            })
+        self._append_item({
+            'type': 'orchestration',
+            'tool_use_id': execution_id,
+            'purpose': purpose or '',
+            'task': args.get('task') or args.get('prompt') or '',
+            'mode': args.get('mode') or '',
+            'crew_status': 'running',
+            'status_detail': '',
+            'failed_stage': '',
+            'pipeline_text': '',
+            'turn': int(self._orch_turn or 1),
+            'stage_specs': specs,
+            'stages': [],
+            'execution_id': execution_id,
+        }, execution_id)
+
+    def _finalize_orchestration(self, item: Dict, result_obj):
+        """Attach the crew outcome without moving the block in the transcript."""
+        result = (result_obj or {}).get('result') if isinstance(result_obj, dict) else None
+        item['pipeline_text'] = ''
+        item['status_detail'] = ''
+        item['failed_stage'] = ''
+        if isinstance(result, str):
+            label = result.strip().lower()
+            item['crew_status'] = label if label in ('completed', 'cancelled', 'error', 'running') else 'error'
+            if label == 'cancelled':
+                item['crew_status'] = 'cancelled'
+            item['status_detail'] = result.strip()
+            return
+        if isinstance(result, dict) and isinstance(result.get('Success'), dict):
+            item['crew_status'] = 'completed'
+            items = result['Success'].get('items') or []
+            item['pipeline_text'] = self._result_items_to_text(items)
+            return
+        if isinstance(result, dict) and 'Error' in result:
+            item['crew_status'] = 'error'
+            err = result.get('Error')
+            if isinstance(err, dict):
+                custom = err.get('Custom')
+                if isinstance(custom, str) and custom.strip():
+                    detail = custom
+                else:
+                    detail = self._json_text(custom if custom is not None else err)
+            else:
+                detail = '' if err is None else str(err)
+            if not isinstance(detail, str):
+                detail = self._json_text(detail)
+            item['status_detail'] = detail
+            match = _FAILED_STAGE_RE.search(detail)
+            if match:
+                item['failed_stage'] = match.group(1)
+            return
+        item['crew_status'] = 'error'
+        item['status_detail'] = self._json_text(result)[:500]
+
     def _append_tool_result(self, tool_use_id: str, result_obj):
+        # A bare "Cancelled" is the whole result object, not a dict around it.
+        if isinstance(result_obj, str):
+            result_obj = {'result': result_obj}
+        idx = self._pending_item_idx.get(tool_use_id)
+        if idx is not None and 0 <= idx < len(self.data) and self.data[idx].get('type') == 'orchestration':
+            self._finalize_orchestration(self.data[idx], result_obj)
+            return
+        if not isinstance(result_obj, dict):
+            return
         status, items, error = self._result_payload(result_obj)
         built_name, params, purpose = self._builtin_tool(result_obj)
         server, mcp_name, mcp_params, mcp_purpose = self._mcp_tool(result_obj)
@@ -2707,6 +2938,10 @@ class CliSessionParser:
             }, execution_id)
             return
 
+        if name == 'subagent' and isinstance(args.get('stages'), list):
+            self._append_orchestration(args, purpose, execution_id)
+            return
+
         if name == 'subagent':
             self._append_item({
                 'type': 'sub_agent',
@@ -2769,8 +3004,1258 @@ def guess_lang(path: str) -> str:
             return lang
     return 'text'
 
+# ──────────────────────────────────────────────────────────────
+# Orchestrations (Kiro CLI AgentCrew / subagent stages)
+#
+# A crew is one subagent tool call with a stages[] list. It sits in the
+# parent transcript at the moment the lead agent launched it. Each stage
+# is its own CLI session (parent_session_id). The default export keeps
+# the roster and each stage's last useful report. Command output, file
+# bodies, and reasoning stay behind filter rows that show their cost.
+# ──────────────────────────────────────────────────────────────
+ORCH_STATUSES = (
+    ('completed', 'Completed'),
+    ('cancelled', 'Cancelled'),
+    ('error', 'Error'),
+    ('running', 'Still running'),
+)
+# (key, label, default_on). Light layers are stored as text. Heavy layers
+# are counted during the scan and loaded only if the export turns them on.
+ORCH_LAYERS = (
+    ('last_state', 'Last state', True),
+    ('roster', 'Stage roster', True),
+    ('brief', 'Stage briefs', False),
+    ('shared_task', 'Shared task', False),
+    ('talk', 'Stage messages', False),
+    ('commands', 'Stage commands', False),
+    ('command_output', 'Stage command output', False),
+    ('reasoning', 'Stage reasoning', False),
+    ('file_read', 'Stage file reads', False),
+    ('file_write', 'Stage file writes', False),
+    ('search', 'Stage searches', False),
+)
+ORCH_LIGHT_LAYERS = ('last_state', 'roster', 'brief', 'shared_task', 'talk', 'commands')
+ORCH_HEAVY_LAYERS = ('command_output', 'reasoning', 'file_read', 'file_write', 'search')
+ORCH_HEAVY_TITLES = {
+    'command_output': 'Command output',
+    'reasoning': 'Reasoning',
+    'file_read': 'File reads',
+    'file_write': 'File writes',
+    'search': 'Searches',
+}
+_STAGE_NAME_RE = re.compile(r'YOUR STAGE:\s*([A-Za-z0-9_-]+)')
+_FAILED_STAGE_RE = re.compile(r"stage\s+'([^']+)'", re.IGNORECASE)
+
+
+def default_orch_filter() -> Dict:
+    return {
+        'statuses': {key: True for key, _label in ORCH_STATUSES},
+        'layers': {key: on for key, _label, on in ORCH_LAYERS},
+        'latest_only': False,
+    }
+
+
+def cap_text(text: str, cap: int) -> str:
+    """Keep the last `cap` lines. cap <= 0 keeps everything."""
+    if not text or cap <= 0:
+        return text or ''
+    lines = text.split('\n')
+    if len(lines) <= cap:
+        return text
+    kept = lines[-cap:]
+    return f"... ({len(lines) - cap} lines trimmed) ...\n" + '\n'.join(kept)
+
+
+def text_line_count(text: str) -> int:
+    if not text:
+        return 0
+    return len(text.split('\n'))
+
+
+def estimate_tokens(chars: int) -> int:
+    if chars <= 0:
+        return 0
+    return max(1, (int(chars) + 3) // 4)
+
+
+def format_tokens(n: int) -> str:
+    n = int(n or 0)
+    if n < 1000:
+        return str(n)
+    if n < 10_000:
+        tenths = n / 1000.0
+        return f"{tenths:.1f}k"
+    if n < 1_000_000:
+        return f"{round(n / 1000)}k"
+    if n < 10_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    return f"{round(n / 1_000_000)}M"
+
+
+def _segment(text: str) -> Optional[Dict[str, int]]:
+    """Size of one heavy block. Whitespace-only text is dropped, matching export.
+
+    `lines` is how `cap_text` splits the text. `nl` is the newline count.
+    `trimmed` stores the exact capped body length for each output-cap choice
+    that actually shortens this text, so the filter can match the export
+    without keeping the body.
+    """
+    if not text or not text.strip():
+        return None
+    nl = text.count('\n')
+    parts = text.split('\n')
+    splits = len(parts)
+    trimmed: Dict[int, int] = {}
+    for cap in CAP_STEPS:
+        if not cap or splits <= cap:
+            continue
+        kept = parts[-cap:]
+        notice = f"... ({splits - cap} lines trimmed) ...\n"
+        trimmed[cap] = len(notice) + sum(len(part) for part in kept) + (cap - 1)
+    return {'chars': len(text), 'nl': nl, 'lines': splits, 'trimmed': trimmed}
+
+
+def _stage_names_in_prompt(data) -> List[str]:
+    names: List[str] = []
+    content = data.get('content') if isinstance(data, dict) else None
+    if not isinstance(content, list):
+        return names
+    for block in content:
+        if not isinstance(block, dict) or block.get('kind') != 'text':
+            continue
+        text = block.get('data') or ''
+        if isinstance(text, str) and 'YOUR STAGE:' in text:
+            names.extend(_STAGE_NAME_RE.findall(text))
+    return names
+
+
+def _stage_label_in_prompt(data) -> str:
+    """Text after the last `YOUR STAGE:` marker, through the end of that line."""
+    label = ''
+    content = data.get('content') if isinstance(data, dict) else None
+    if not isinstance(content, list):
+        return ''
+    marker = 'YOUR STAGE:'
+    for block in content:
+        if not isinstance(block, dict) or block.get('kind') != 'text':
+            continue
+        text = block.get('data') or ''
+        if not isinstance(text, str) or marker not in text:
+            continue
+        for line in text.splitlines():
+            idx = line.find(marker)
+            if idx >= 0:
+                label = line[idx + len(marker):].strip()
+    return label
+
+
+def _label_matches_spec(label: str, name: str) -> bool:
+    if not label or not name:
+        return False
+    if label == name:
+        return True
+    # `log_slice_1 - analyze this` names `log_slice_1`. A hyphen with no
+    # space stays inside the name, so `log_slice_1-extra` is not `log_slice_1`.
+    if len(label) > len(name) and label.startswith(name):
+        return label[len(name)] in ' \t:—'
+    return False
+
+
+def _resolve_stage_name(label: str, token: str, orchestrations: List[Dict]) -> str:
+    """Longest spec name the YOUR STAGE line actually names.
+
+    The token regex stops at a space, so `code review` would become `code`.
+    The raw line is matched against the crew's own stage names first.
+    """
+    raw = (label or '').strip()
+    best = ''
+    if raw:
+        for orch in orchestrations or []:
+            for spec in orch.get('stage_specs') or []:
+                name = spec.get('name') or ''
+                if _label_matches_spec(raw, name) and len(name) > len(best):
+                    best = name
+    return best or token or ''
+
+
+def _prompt_text(data) -> str:
+    content = data.get('content') if isinstance(data, dict) else None
+    if not isinstance(content, list):
+        return ''
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get('kind') == 'text' and isinstance(block.get('data'), str):
+            parts.append(block['data'])
+    return '\n'.join(parts)
+
+
+def _piece_metrics(text: str) -> Tuple[int, int]:
+    """Newline count and length. Both add up exactly when the pieces are joined."""
+    if not text:
+        return 0, 0
+    return text.count('\n'), len(text)
+
+
+def _push_segment(bucket: Dict[str, List[Dict[str, int]]], layer: str, text: str):
+    seg = _segment(text)
+    if seg:
+        bucket[layer].append(seg)
+
+
+def _tool_call_input(block_data: Dict) -> Dict:
+    raw = block_data.get('input') if isinstance(block_data, dict) else None
+    if isinstance(raw, dict):
+        return {k: v for k, v in raw.items() if k != '__tool_use_purpose'}
+    return {}
+
+
+def _stringify_tool_value(value) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _cli_result_body(result_obj) -> Tuple[str, List]:
+    """Return (status_key, items) from a Kiro CLI tool result object."""
+    result = (result_obj or {}).get('result') if isinstance(result_obj, dict) else None
+    if isinstance(result, str):
+        return result, []
+    if not isinstance(result, dict) or not result:
+        return '', []
+    key = next(iter(result))
+    body = result.get(key)
+    if isinstance(body, dict):
+        items = body.get('items') or []
+        return str(key), items if isinstance(items, list) else []
+    return str(key), []
+
+
+def _cli_output_text(result_obj) -> str:
+    _status, items = _cli_result_body(result_obj)
+    json_item = CliSessionParser._first_json_item(items)
+    if isinstance(json_item, dict) and ('stdout' in json_item or 'stderr' in json_item):
+        out = json_item.get('stdout') or ''
+        err = json_item.get('stderr') or ''
+        if not isinstance(out, str):
+            out = _stringify_tool_value(out)
+        if not isinstance(err, str):
+            err = _stringify_tool_value(err)
+        text = out
+        if err:
+            text = (text + '\n' if text else '') + err
+        return text
+    return CliSessionParser._result_items_to_text(items)
+
+
+def _heavy_layer_for_tool(name: str) -> str:
+    if name == 'shell':
+        return 'command_output'
+    if name == 'read':
+        return 'file_read'
+    if name == 'write':
+        return 'file_write'
+    if name in ('grep', 'glob', 'code', 'search', 'web_search', 'web_fetch', 'fetch', 'searchGitHub'):
+        return 'search'
+    return ''
+
+
+def scan_stage_jsonl(path: Path, keep_heavy: Optional[Set[str]] = None) -> Dict:
+    """Stream one stage session. Light text is kept. Heavy text is counted
+    unless `keep_heavy` names layers whose bodies must be returned."""
+    keep_heavy = set(keep_heavy or ())
+    out = {
+        'stage_names': [],
+        'report': '',
+        'utterance': '',
+        'talk_parts': [],
+        'commands': [],
+        'tool_counts': {},
+        'last_tool': '',
+        'last_detail': '',
+        'prompt': '',
+        'stage_label': '',
+        'segments': {key: [] for key in ORCH_HEAVY_LAYERS},
+        'heavy_texts': {key: [] for key in keep_heavy},
+        'events': 0,
+    }
+    if not path or not path.exists():
+        return out
+    pending: Dict[str, str] = {}
+    counts: Dict[str, int] = {}
+    loads = _orjson.loads if _orjson is not None else None
+    try:
+        fh = open(path, 'rb')
+    except Exception:
+        return out
+    with fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw or raw[0] != 123:  # '{'
+                continue
+            try:
+                obj = loads(raw) if loads is not None else json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            out['events'] += 1
+            kind = obj.get('kind')
+            data = obj.get('data') or {}
+            if not isinstance(data, dict):
+                continue
+            if kind == 'Prompt' and not out['stage_names'] and not out.get('stage_label'):
+                names = _stage_names_in_prompt(data)
+                label = _stage_label_in_prompt(data)
+                if names or label:
+                    if names:
+                        out['stage_names'] = names
+                    if label:
+                        out['stage_label'] = label
+                    out['prompt'] = _prompt_text(data) or out.get('prompt') or ''
+                elif not out.get('prompt'):
+                    out['prompt'] = _prompt_text(data)
+            elif kind == 'AssistantMessage':
+                blocks = data.get('content')
+                if not isinstance(blocks, list):
+                    blocks = []
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    bk = block.get('kind')
+                    bd = block.get('data')
+                    if bk == 'text':
+                        text = bd if isinstance(bd, str) else ''
+                        if text.strip():
+                            if out['utterance']:
+                                out['talk_parts'].append(out['utterance'])
+                            out['utterance'] = text
+                    elif bk == 'thinking':
+                        text = bd.get('text') if isinstance(bd, dict) else ''
+                        text = text or ''
+                        _push_segment(out['segments'], 'reasoning', text)
+                        if 'reasoning' in keep_heavy and text:
+                            out['heavy_texts']['reasoning'].append(text)
+                    elif bk == 'toolUse' and isinstance(bd, dict):
+                        name = str(bd.get('name') or 'tool')
+                        counts[name] = counts.get(name, 0) + 1
+                        args = _tool_call_input(bd)
+                        tool_id = str(bd.get('toolUseId') or '')
+                        if tool_id:
+                            pending[tool_id] = name
+                        out['last_tool'] = name
+                        if name == 'shell':
+                            cmd = _stringify_tool_value(args.get('command') or '')
+                            if cmd.strip():
+                                out['commands'].append(cmd)
+                                out['last_detail'] = cmd.strip().splitlines()[0][:180]
+                        elif name == 'summary':
+                            task_result = args.get('taskResult') or ''
+                            if isinstance(task_result, str) and task_result.strip():
+                                out['report'] = task_result
+                            detail = (args.get('taskDescription') or '') if isinstance(args.get('taskDescription'), str) else ''
+                            out['last_detail'] = (detail or 'summary').strip().splitlines()[0][:180]
+                        elif name == 'write':
+                            content = _stringify_tool_value(args.get('content') or args.get('newStr') or args.get('new') or '')
+                            _push_segment(out['segments'], 'file_write', content)
+                            if 'file_write' in keep_heavy and content:
+                                out['heavy_texts']['file_write'].append(content)
+                            path_s = _stringify_tool_value(args.get('path') or args.get('file_path') or 'write')
+                            out['last_detail'] = path_s[:180]
+                        elif name == 'read':
+                            ops = args.get('operations') or []
+                            path_s = ''
+                            if isinstance(ops, list) and ops and isinstance(ops[0], dict):
+                                path_s = str(ops[0].get('path') or '')
+                            path_s = path_s or _stringify_tool_value(args.get('path') or 'read')
+                            out['last_detail'] = path_s[:180]
+                        elif name in ('grep', 'glob', 'code'):
+                            query = _stringify_tool_value(args.get('pattern') or args.get('query') or args.get('operation') or name)
+                            out['last_detail'] = query[:180]
+                        else:
+                            out['last_detail'] = name
+            elif kind == 'ToolResults':
+                results = data.get('results') or {}
+                if not isinstance(results, dict):
+                    continue
+                for tool_id, payload in results.items():
+                    name = pending.get(str(tool_id), '')
+                    if name == 'summary':
+                        if not out['report']:
+                            text = _cli_output_text(payload)
+                            if text.strip():
+                                out['report'] = text
+                        continue
+                    layer = _heavy_layer_for_tool(name)
+                    if not layer or layer == 'file_write':
+                        continue
+                    text = _cli_output_text(payload)
+                    _push_segment(out['segments'], layer, text)
+                    if layer in keep_heavy and text:
+                        out['heavy_texts'][layer].append(text)
+    out['tool_counts'] = counts
+    return out
+
+
+def split_pipeline_reports(text: str, stage_names: List[str]) -> Dict[str, str]:
+    """Split a crew's pipeline text on exact `## <stage name>` lines.
+
+    Headings inside a stage report stay inside that report.
+    """
+    names = [n for n in stage_names if n]
+    name_set = set(names)
+    buckets = {n: [] for n in names}
+    current = None
+    for line in (text or '').split('\n'):
+        if line.startswith('## '):
+            candidate = line[3:].strip()
+            if candidate in name_set:
+                current = candidate
+                continue
+        if current is not None:
+            buckets[current].append(line)
+    return {name: '\n'.join(lines).strip() for name, lines in buckets.items()}
+
+
+def _norm_task_title(title: str) -> str:
+    text = (title or '').strip()
+    if text.endswith('...'):
+        text = text[:-3].rstrip()
+    return text
+
+
+def _task_matches_title(task: str, title: str) -> bool:
+    key = _norm_task_title(title)
+    if not key:
+        return False
+    task = task or ''
+    # A short title is only that exact task. `fix` must not match `fix the bug`.
+    if len(key) < 24:
+        return task == key or task.startswith(key + '\n')
+    if task.startswith(key):
+        return True
+    # Kiro truncates the session title. A long stored title is still a prefix.
+    probe = key[:80].rstrip()
+    return len(probe) >= 40 and task.startswith(probe)
+
+
+def _brief_match_score(task: str, brief: str, prompt: str) -> int:
+    """How strongly this stage brief is the prompt the child actually received.
+
+    Kiro stores the template with a `{task}` placeholder and sends the child
+    the template with that placeholder filled. A later crew that reused a
+    stage name still has its own brief, so the prompt identifies the crew.
+    """
+    prompt = prompt or ''
+    brief = brief or ''
+    if not prompt or not brief:
+        return 0
+    rendered = brief.replace('{task}', task or '')
+    if rendered and prompt.strip() == rendered.strip():
+        return max(len(rendered), 1)
+    if len(rendered) >= 24 and rendered in prompt:
+        return len(rendered)
+    if '{task}' in brief:
+        tail = brief.split('{task}', 1)[1].strip()
+        if len(tail) >= 24 and tail in prompt:
+            return len(tail)
+    return 0
+
+
+def _crew_stage_score(orch: Dict, stage_name: str, prompt: str, title: str) -> int:
+    specs = orch.get('stage_specs') or []
+    names = [spec.get('name') for spec in specs]
+    if stage_name and stage_name not in names:
+        return 0
+    brief = ''
+    for spec in specs:
+        if spec.get('name') == stage_name:
+            brief = spec.get('brief') or ''
+            break
+    score = _brief_match_score(orch.get('task') or '', brief, prompt)
+    if score:
+        return score + 1  # stay above the title-only fallback
+    if _task_matches_title(orch.get('task') or '', title):
+        return 1
+    return 0
+
+
+def _format_tool_counts(counts: Dict[str, int]) -> str:
+    if not counts:
+        return ''
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    parts = [f"{name} ×{n}" for name, n in ordered[:6]]
+    extra = len(ordered) - len(parts)
+    if extra > 0:
+        parts.append(f"+{extra}")
+    return ', '.join(parts)
+
+
+def _status_sentence(status: str) -> str:
+    return {
+        'finished': 'Finished.',
+        'partial': 'Stopped with a partial answer and no final report.',
+        'interrupted': 'Stopped with no final answer.',
+        'never_started': 'This stage never started.',
+        'not_started_yet': 'This stage has not started yet.',
+        'failed': 'This stage failed.',
+        'running': 'Still running at export.',
+    }.get(status, status)
+
+
+def _source_sentence(source: str, crew_status: str) -> str:
+    if source == 'pipeline':
+        return 'Final report returned to the lead agent.'
+    if source == 'summary':
+        if crew_status == 'completed':
+            return 'Final report recovered from the stage.'
+        return 'Final report recovered from the stage. The crew itself did not return a pipeline.'
+    if source == 'utterance':
+        return 'No final report. This is the last thing the stage said.'
+    if crew_status == 'running':
+        return 'No answer recorded yet.'
+    return 'No answer was recorded.'
+
+
+def _parent_result_line(item: Dict) -> str:
+    status = item.get('crew_status') or 'running'
+    detail = (item.get('status_detail') or '').strip()
+    launched = len(item.get('stages') or [])
+    if status == 'completed':
+        return f"Parent result: completed. The pipeline returned reports for the stages below ({launched} launched)."
+    if status == 'cancelled':
+        return "Parent result: cancelled. The crew returned no pipeline report, so each stage below is its own last recorded state."
+    if status == 'error':
+        extra = f" {detail}" if detail else ''
+        return "Parent result: error." + extra
+    return "Parent result: still running. Finished stages keep their reports. The others show the last recorded state."
+
+
+def _stage_counts_phrase(stages: List[Dict]) -> str:
+    launched = len(stages)
+    started = sum(1 for s in stages if s.get('session_id'))
+    with_report = sum(1 for s in stages if (s.get('report') or '').strip())
+    not_started = sum(1 for s in stages if s.get('status') in ('never_started', 'not_started_yet'))
+    return (f"{launched} launched · {started} started · {with_report} with a report · "
+            f"{not_started} not started")
+
+
+def _md_fence(text: str, cap: int = 0) -> str:
+    shown = cap_text(text or '', cap)
+    return f"```text\n{shown}\n```\n\n"
+
+
+def assemble_crew_parts(item: Dict):
+    """Build the markdown pieces the filter and the export both use."""
+    status = item.get('crew_status') or 'running'
+    label = {
+        'completed': 'COMPLETED',
+        'cancelled': 'CANCELLED',
+        'error': 'ERROR',
+        'running': 'RUNNING',
+    }.get(status, status.upper())
+    ordinal = int(item.get('ordinal_in_turn') or 1)
+    total = int(item.get('turn_orch_count') or 1)
+    purpose = (item.get('purpose') or 'Orchestration').strip() or 'Orchestration'
+    header = (
+        f"## 🎭 Orchestration {ordinal}/{total} in this turn — {label}\n\n"
+        f"**{purpose}**\n\n"
+        f"- {_parent_result_line(item)}\n"
+        f"- Stages: {_stage_counts_phrase(item.get('stages') or [])}\n"
+        f"- Id: `{item.get('tool_use_id') or '?'}`\n\n"
+    )
+    marker = (
+        f"## 🎭 Orchestration {ordinal}/{total} in this turn — {label}\n\n"
+        f"**{purpose}**\n\n"
+        f"_Omitted ({label.lower()}). {_stage_counts_phrase(item.get('stages') or [])}. "
+        f"Turn this status on in the filter to include the stage reports._\n\n"
+    )
+    task = (item.get('task') or '').strip()
+    shared = ''
+    if task:
+        shared = f"**Shared task given to every stage:**\n\n{_md_fence(task)}"
+    roster_rows = ['| Stage | Status | Report | Tools |', '|---|---|---|---|']
+    stage_parts = []
+    measure_stages = []
+    for stage in item.get('stages') or []:
+        name = stage.get('name') or '(unnamed)'
+        status_label = (stage.get('status') or 'unknown').replace('_', ' ')
+        if stage.get('superseded'):
+            status_label += ', superseded'
+        elif stage.get('latest_attempt'):
+            status_label += ', latest'
+        report = (stage.get('report') or '').strip()
+        if report:
+            report_cell = f"{len(report):,} chars"
+        elif (stage.get('utterance') or '').strip():
+            report_cell = 'partial'
+        else:
+            report_cell = '—'
+        tools = _format_tool_counts(stage.get('tool_counts') or {}) or '—'
+        safe_name = name.replace('|', '/')
+        roster_rows.append(f"| `{safe_name}` | {status_label} | {report_cell} | {tools} |")
+
+        source = stage.get('report_source') or 'none'
+        body_bits = [f"### {name} — {status_label}", '', f"_{_source_sentence(source, status)}_"]
+        if stage.get('failed') and item.get('status_detail'):
+            body_bits.append(f"Crew error: {item.get('status_detail')}")
+        model = stage.get('model') or ''
+        if model:
+            body_bits.append(f"Model: `{model}`")
+        tools_line = _format_tool_counts(stage.get('tool_counts') or {})
+        if tools_line:
+            body_bits.append(f"Tools: {tools_line}")
+        if not report:
+            if stage.get('last_tool'):
+                detail = stage.get('last_detail') or ''
+                extra = f" — {detail}" if detail else ''
+                body_bits.append(f"Last tool: `{stage.get('last_tool')}`{extra}")
+            elif stage.get('status') in ('never_started', 'not_started_yet'):
+                body_bits.append(_status_sentence(stage.get('status')))
+        utterance = (stage.get('utterance') or '').strip()
+        shown = report or (utterance if source == 'utterance' else '')
+        if shown:
+            body_bits.extend(['', shown])
+        body_bits.append('')
+        last_state = '\n'.join(body_bits) + '\n'
+        note = (
+            f"### {name} — {status_label}\n\n"
+            f"_Later attempt kept. Body omitted by Latest attempt only._\n\n"
+        )
+        brief = (stage.get('brief') or '').strip()
+        brief_md = f"**Stage brief:**\n\n{_md_fence(brief)}" if brief else ''
+        talk = (stage.get('talk') or '').strip()
+        talk_md = f"**What the stage said along the way:**\n\n{talk}\n\n" if talk else ''
+        commands = [c for c in (stage.get('commands') or []) if isinstance(c, str) and c.strip()]
+        if commands:
+            joined = '\n\n'.join('$ ' + c.strip() for c in commands)
+            commands_md = f"**Commands the stage ran:** {len(commands)}\n\n{_md_fence(joined)}"
+        else:
+            commands_md = ''
+        segments = stage.get('segments') or {}
+        stage_parts.append({
+            'name': name,
+            'session_id': stage.get('session_id') or '',
+            'session_path': stage.get('session_path') or '',
+            'superseded': bool(stage.get('superseded')),
+            'last_state': last_state,
+            'superseded_note': note,
+            'brief': brief_md,
+            'talk': talk_md,
+            'commands': commands_md,
+            'segments': segments,
+        })
+        measure_stages.append({
+            'superseded': bool(stage.get('superseded')),
+            'last_state': _piece_metrics(last_state),
+            'note': _piece_metrics(note),
+            'brief': _piece_metrics(brief_md),
+            'talk': _piece_metrics(talk_md),
+            'commands': _piece_metrics(commands_md),
+            'segments': segments,
+        })
+    roster = '\n'.join(roster_rows) + '\n\n'
+    item['parts'] = {
+        'header': header,
+        'marker': marker,
+        'shared_task': shared,
+        'roster': roster,
+        'stages': stage_parts,
+    }
+    item['measure'] = {
+        'header': _piece_metrics(header),
+        'marker': _piece_metrics(marker),
+        'shared_task': _piece_metrics(shared),
+        'roster': _piece_metrics(roster),
+        'stages': measure_stages,
+    }
+
+
+def _heavy_markdown(layer: str, texts: List[str], cap: int) -> str:
+    blocks = []
+    for text in texts or []:
+        if not isinstance(text, str) or not text.strip():
+            continue
+        blocks.append(f"```text\n{cap_text(text, cap)}\n```")
+    if not blocks:
+        return ''
+    title = ORCH_HEAVY_TITLES.get(layer, layer)
+    return f"**{title}** ({len(blocks)})\n\n" + '\n\n'.join(blocks) + '\n\n'
+
+
+def _notice_len(trimmed: int) -> int:
+    digits = 1
+    value = trimmed
+    while value >= 10:
+        digits += 1
+        value //= 10
+    return 24 + digits  # len('... (N lines trimmed) ...')
+
+
+def _heavy_body_size(seg: Dict, cap: int) -> Tuple[int, int]:
+    """Newline count and length of `cap_text` for one stored segment."""
+    chars = int(seg.get('chars') or 0)
+    if seg.get('nl') is None:
+        nl = max(0, int(seg.get('lines') or 1) - 1)
+        splits = nl + 1
+    else:
+        nl = int(seg.get('nl') or 0)
+        splits = int(seg.get('lines') or (nl + 1))
+    if cap > 0 and splits > cap:
+        trimmed = seg.get('trimmed') or {}
+        if cap in trimmed:
+            return cap, int(trimmed[cap])
+        # A cap this UI does not offer: lines are exact, characters are proportional.
+        kept = int(round(chars * (cap / splits)))
+        return cap, kept + _notice_len(splits - cap) + 1
+    return nl, chars
+
+
+def _heavy_estimate(segments: List[Dict], cap: int, layer: str,
+                    cache: Optional[Dict] = None) -> Tuple[int, int]:
+    """Newline count and length of `_heavy_markdown` for these segments.
+
+    Counts match the fenced export for an unlimited cap and for every cap in
+    the filter. Repeated filter redraws reuse `cache`.
+    """
+    if cache is not None:
+        hit = cache.get((layer, cap))
+        if hit is not None:
+            return hit
+    usable = [s for s in (segments or []) if int(s.get('chars') or 0) > 0 or int(s.get('lines') or 0) > 0]
+    if not usable:
+        if cache is not None:
+            cache[(layer, cap)] = (0, 0)
+        return 0, 0
+    body_nl = 0
+    body_chars = 0
+    for seg in usable:
+        nl, chars = _heavy_body_size(seg, cap)
+        # ```text\n{body}\n```
+        body_nl += nl + 2
+        body_chars += chars + len('```text\n') + len('\n```')
+    n = len(usable)
+    heading = f"**{ORCH_HEAVY_TITLES.get(layer, layer)}** ({n})\n\n"
+    # Heading, a blank line between blocks, and the trailing blank line.
+    result = (heading.count('\n') + body_nl + 2 * (n - 1) + 2,
+              len(heading) + body_chars + 2 * (n - 1) + 2)
+    if cache is not None:
+        cache[(layer, cap)] = result
+    return result
+
+
+def render_orchestration(item: Dict, orch_filter: Optional[Dict] = None,
+                         output_cap: int = 0, heavy: Optional[Dict] = None) -> str:
+    filt = orch_filter or default_orch_filter()
+    parts = item.get('parts') or {}
+    status = item.get('crew_status') or 'running'
+    if not filt.get('statuses', {}).get(status, True):
+        return parts.get('marker') or ''
+    chunks: List[str] = [parts.get('header') or '']
+    layers = filt.get('layers') or {}
+    if layers.get('shared_task'):
+        chunks.append(parts.get('shared_task') or '')
+    if layers.get('roster'):
+        chunks.append(parts.get('roster') or '')
+    latest_only = bool(filt.get('latest_only'))
+    heavy = heavy or {}
+    for stage in parts.get('stages') or []:
+        skip_body = latest_only and stage.get('superseded')
+        if layers.get('last_state'):
+            chunks.append(stage.get('superseded_note') if skip_body else (stage.get('last_state') or ''))
+        if skip_body:
+            continue
+        for layer in ('brief', 'talk', 'commands'):
+            if layers.get(layer):
+                chunks.append(stage.get(layer) or '')
+        session_id = stage.get('session_id') or ''
+        for layer in ORCH_HEAVY_LAYERS:
+            if not layers.get(layer):
+                continue
+            texts = heavy.get((session_id, layer))
+            if texts:
+                chunks.append(_heavy_markdown(layer, texts, output_cap))
+    return ''.join(chunks)
+
+
+def _string_metrics(text: str) -> Tuple[int, int]:
+    if not text:
+        return 0, 0
+    return text_line_count(text), len(text)
+
+
+def _crew_body_metrics(item: Dict, orch_filter: Dict, output_cap: int) -> Tuple[int, int]:
+    """Size of one crew's export body. Integer adds only — the strings were measured once."""
+    measure = item.get('measure') or {}
+    lines, chars = measure.get('header') or (0, 0)
+    layers = orch_filter.get('layers') or {}
+    if layers.get('shared_task'):
+        piece = measure.get('shared_task') or (0, 0)
+        lines += piece[0]
+        chars += piece[1]
+    if layers.get('roster'):
+        piece = measure.get('roster') or (0, 0)
+        lines += piece[0]
+        chars += piece[1]
+    latest_only = bool(orch_filter.get('latest_only'))
+    for stage in measure.get('stages') or []:
+        skip_body = latest_only and stage.get('superseded')
+        if layers.get('last_state'):
+            piece = (stage.get('note') if skip_body else stage.get('last_state')) or (0, 0)
+            lines += piece[0]
+            chars += piece[1]
+        if skip_body:
+            continue
+        for layer in ('brief', 'talk', 'commands'):
+            if layers.get(layer):
+                piece = stage.get(layer) or (0, 0)
+                lines += piece[0]
+                chars += piece[1]
+        for layer in ORCH_HEAVY_LAYERS:
+            if not layers.get(layer):
+                continue
+            heavy_lines, heavy_chars = _heavy_estimate(
+                (stage.get('segments') or {}).get(layer) or [], output_cap, layer,
+                stage.setdefault('_hcache', {}),
+            )
+            lines += heavy_lines
+            chars += heavy_chars
+    return lines, chars
+
+
+def _layer_piece(stage: Dict, layer: str, latest_only: bool) -> Tuple[int, int]:
+    skip_body = latest_only and stage.get('superseded')
+    if layer == 'last_state':
+        return (stage.get('note') if skip_body else stage.get('last_state')) or (0, 0)
+    if skip_body:
+        return 0, 0
+    if layer in ORCH_HEAVY_LAYERS:
+        return 0, 0
+    return stage.get(layer) or (0, 0)
+
+
+def orchestration_accounting(parsers, orch_filter: Optional[Dict] = None,
+                             output_cap: int = 0) -> Dict:
+    """Line and character totals for the filter. No markdown is rebuilt here."""
+    filt = orch_filter or default_orch_filter()
+    statuses_on = filt.get('statuses') or {}
+    layers_on = filt.get('layers') or {}
+    latest_only = bool(filt.get('latest_only'))
+    selected_lines = selected_chars = 0
+    by_status = {key: [0, 0] for key, _label in ORCH_STATUSES}
+    by_layer = {key: [0, 0] for key, _label, _on in ORCH_LAYERS}
+    by_status_crews = {key: 0 for key, _label in ORCH_STATUSES}
+    crews = 0
+    stages = 0
+    for parser in parsers or []:
+        for item in getattr(parser, 'data', []) or []:
+            if item.get('type') != 'orchestration':
+                continue
+            crews += 1
+            status = item.get('crew_status') or 'running'
+            by_status_crews[status] = by_status_crews.get(status, 0) + 1
+            measure = item.get('measure') or {}
+            stages += len(measure.get('stages') or [])
+            body_lines, body_chars = _crew_body_metrics(item, filt, output_cap)
+            by_status.setdefault(status, [0, 0])
+            by_status[status][0] += body_lines
+            by_status[status][1] += body_chars
+            if statuses_on.get(status, True):
+                selected_lines += body_lines
+                selected_chars += body_chars
+            else:
+                marker = measure.get('marker') or (0, 0)
+                selected_lines += marker[0]
+                selected_chars += marker[1]
+            if not statuses_on.get(status, True):
+                continue
+            if measure.get('shared_task'):
+                by_layer['shared_task'][0] += measure['shared_task'][0]
+                by_layer['shared_task'][1] += measure['shared_task'][1]
+            if measure.get('roster'):
+                by_layer['roster'][0] += measure['roster'][0]
+                by_layer['roster'][1] += measure['roster'][1]
+            for stage in measure.get('stages') or []:
+                for layer in ('last_state', 'brief', 'talk', 'commands'):
+                    piece = _layer_piece(stage, layer, latest_only)
+                    by_layer[layer][0] += piece[0]
+                    by_layer[layer][1] += piece[1]
+                if latest_only and stage.get('superseded'):
+                    continue
+                for layer in ORCH_HEAVY_LAYERS:
+                    heavy_lines, heavy_chars = _heavy_estimate(
+                        (stage.get('segments') or {}).get(layer) or [], output_cap, layer,
+                        stage.setdefault('_hcache', {}),
+                    )
+                    by_layer[layer][0] += heavy_lines
+                    by_layer[layer][1] += heavy_chars
+
+    def pack(pair):
+        return {'lines': pair[0], 'chars': pair[1], 'tokens': estimate_tokens(pair[1])}
+
+    return {
+        'selected_lines': selected_lines,
+        'selected_chars': selected_chars,
+        'selected_tokens': estimate_tokens(selected_chars),
+        'crews': crews,
+        'stages': stages,
+        'by_status': {key: pack(value) for key, value in by_status.items()},
+        'by_status_crews': by_status_crews,
+        'by_layer': {key: pack(value) for key, value in by_layer.items()},
+    }
+
+
+def orchestration_metrics(item: Dict, orch_filter: Optional[Dict] = None,
+                          output_cap: int = 0) -> Tuple[int, int]:
+    """Lines and characters this one crew contributes to the current export."""
+    class _P:
+        def __init__(self, data):
+            self.data = data
+    stats = orchestration_accounting([_P([item])], orch_filter, output_cap)
+    return stats['selected_lines'], stats['selected_chars']
+
+
+def load_orchestration_heavy(item: Dict, orch_filter: Dict, output_cap: int = 0) -> Dict:
+    """Re-read stage sessions for heavy layers the export actually turned on."""
+    layers = orch_filter.get('layers') or {}
+    wanted = {key for key in ORCH_HEAVY_LAYERS if layers.get(key)}
+    loaded: Dict = {}
+    if not wanted:
+        return loaded
+    latest_only = bool(orch_filter.get('latest_only'))
+    for stage in (item.get('parts') or {}).get('stages') or []:
+        if latest_only and stage.get('superseded'):
+            continue
+        path_s = stage.get('session_path') or ''
+        session_id = stage.get('session_id') or ''
+        if not path_s or not session_id:
+            continue
+        scanned = scan_stage_jsonl(Path(path_s), keep_heavy=wanted)
+        for layer in wanted:
+            texts = scanned.get('heavy_texts', {}).get(layer) or []
+            if texts:
+                loaded[(session_id, layer)] = texts
+    return loaded
+
+
+def _blank_stage(spec: Dict) -> Dict:
+    return {
+        'name': spec.get('name') or '(unnamed)',
+        'role': spec.get('role') or '',
+        'model': spec.get('model') or '',
+        'brief': spec.get('brief') or '',
+        'session_id': '',
+        'session_path': '',
+        'created_at': '',
+        'status': 'never_started',
+        'report': '',
+        'report_source': 'none',
+        'utterance': '',
+        'talk': '',
+        'commands': [],
+        'tool_counts': {},
+        'last_tool': '',
+        'last_detail': '',
+        'segments': {key: [] for key in ORCH_HEAVY_LAYERS},
+        'superseded': False,
+        'latest_attempt': False,
+        'failed': False,
+    }
+
+
+def _apply_child_scan(stage: Dict, scan: Dict, pipeline_text: str, crew_status: str, failed: bool):
+    pipeline_text = (pipeline_text or '').strip()
+    summary = (scan.get('report') or '').strip()
+    utterance = (scan.get('utterance') or '').strip()
+    if pipeline_text:
+        stage['report'] = pipeline_text
+        stage['report_source'] = 'pipeline'
+    elif summary:
+        stage['report'] = summary
+        stage['report_source'] = 'summary'
+    elif utterance:
+        stage['report'] = ''
+        stage['report_source'] = 'utterance'
+    else:
+        stage['report'] = ''
+        stage['report_source'] = 'none'
+    stage['utterance'] = utterance
+    talk_parts = [p for p in (scan.get('talk_parts') or []) if isinstance(p, str) and p.strip()]
+    report_text = pipeline_text or summary
+    # The final utterance is not part of the running transcript. When a real
+    # report exists, the messages layer would otherwise drop it.
+    if report_text and utterance and utterance not in talk_parts and utterance not in report_text:
+        talk_parts.append(utterance)
+    stage['talk'] = '\n\n'.join(talk_parts)
+    stage['commands'] = list(scan.get('commands') or [])
+    stage['tool_counts'] = dict(scan.get('tool_counts') or {})
+    stage['last_tool'] = scan.get('last_tool') or ''
+    stage['last_detail'] = scan.get('last_detail') or ''
+    stage['segments'] = scan.get('segments') or {key: [] for key in ORCH_HEAVY_LAYERS}
+    stage['failed'] = failed
+    has_session = bool(stage.get('session_id'))
+    has_report = bool(stage.get('report'))
+    if failed:
+        stage['status'] = 'failed'
+    elif has_report:
+        stage['status'] = 'finished'
+    elif not has_session:
+        stage['status'] = 'not_started_yet' if crew_status == 'running' else 'never_started'
+    elif crew_status == 'running':
+        stage['status'] = 'partial' if utterance else 'running'
+    elif utterance or stage['report_source'] == 'utterance':
+        stage['status'] = 'partial'
+    else:
+        stage['status'] = 'interrupted'
+
+
+def _discover_stage_sessions(sessions_dir: Path, parent_id: str) -> List[Dict]:
+    """Find child sessions by a byte search, then parse only the matches."""
+    if not sessions_dir or not sessions_dir.exists():
+        return []
+    needle = f'"parent_session_id":"{parent_id}"'.encode('ascii')
+    needle_spaced = f'"parent_session_id": "{parent_id}"'.encode('ascii')
+    paths = []
+    try:
+        for entry in os.scandir(sessions_dir):
+            name = entry.name
+            if not name.endswith('.json') or name[:-5] == parent_id:
+                continue
+            try:
+                if entry.stat().st_size > 262144:
+                    continue
+            except OSError:
+                continue
+            paths.append(entry.path)
+    except OSError:
+        return []
+
+    def _one(path_s: str):
+        try:
+            with open(path_s, 'rb') as fh:
+                raw = fh.read()
+        except OSError:
+            return None
+        if needle not in raw and needle_spaced not in raw:
+            return None
+        try:
+            data = _orjson.loads(raw) if _orjson is not None else json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(data, dict) or data.get('parent_session_id') != parent_id:
+            return None
+        fp = Path(path_s)
+        return {
+            'id': fp.stem,
+            'path': fp,
+            'jsonl': fp.with_suffix('.jsonl'),
+            'title': data.get('title') or '',
+            'created_at': data.get('created_at') or '',
+        }
+
+    if not paths:
+        return []
+    from concurrent.futures import ThreadPoolExecutor
+    workers = min(32, len(paths))
+    found = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for row in pool.map(_one, paths, chunksize=64):
+            if row:
+                found.append(row)
+    found.sort(key=lambda row: (row.get('created_at') or '', row.get('id') or ''))
+    return found
+
+
+def _open_stage_slot(orch: Dict, filled_map: Dict, stage_name: str) -> bool:
+    """A crew can take one child per time it lists this stage name."""
+    needed = sum(
+        1 for spec in (orch.get('stage_specs') or [])
+        if (spec.get('name') or '') == stage_name
+    )
+    return len(filled_map.get(stage_name) or []) < needed
+
+
+def _assign_stage_sessions(orchestrations: List[Dict], children: List[Dict]):
+    """Attach each child session to the crew and stage it belongs to.
+
+    The child prompt is the stage brief with `{task}` filled in, so a later
+    crew wins when its own brief matches. An equal brief score keeps the crew
+    whose task matches the child title, and otherwise the earlier crew.
+    A crew that lists one name twice takes that many children, in creation order.
+    """
+    scans = []
+    from concurrent.futures import ThreadPoolExecutor
+    indexed = list(enumerate(children))
+
+    def _scan_one(pair):
+        idx, child = pair
+        scan = scan_stage_jsonl(child['jsonl'])
+        names = scan.get('stage_names') or []
+        token = names[-1] if names else ''
+        stage_name = _resolve_stage_name(scan.get('stage_label') or '', token, orchestrations)
+        if not stage_name:
+            stage_name = '(unnamed)'
+        return idx, stage_name, scan
+
+    if indexed:
+        workers = min(8, len(indexed))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for idx, stage_name, scan in pool.map(_scan_one, indexed):
+                scans.append((idx, stage_name, scan))
+        scans.sort(key=lambda row: row[0])
+
+    filled = []  # parallel to orchestrations: name -> [(child, scan), ...]
+    for orch in orchestrations:
+        filled.append({})
+    unmatched = []
+    for idx, stage_name, scan in scans:
+        child = children[idx]
+        prompt = scan.get('prompt') or ''
+        title = child.get('title') or ''
+        best_i = None
+        best_rank = (0, 0)
+        for orch_i, orch in enumerate(orchestrations):
+            if not _open_stage_slot(orch, filled[orch_i], stage_name):
+                continue
+            score = _crew_stage_score(orch, stage_name, prompt, title)
+            if score <= 0:
+                continue
+            title_hit = 1 if _task_matches_title(orch.get('task') or '', title) else 0
+            # A higher brief wins. The same brief keeps the title match, then
+            # the earlier crew.
+            rank = (score, title_hit)
+            if rank > best_rank:
+                best_rank = rank
+                best_i = orch_i
+        if best_i is None:
+            unmatched.append((child, stage_name, scan))
+            continue
+        filled[best_i].setdefault(stage_name, []).append((child, scan))
+    return filled, unmatched
+
+
+def _stage_strength(stage: Dict) -> int:
+    """2 = final report, 1 = partial answer, 0 = nothing recorded."""
+    if (stage.get('report') or '').strip():
+        return 2
+    if stage.get('report_source') == 'utterance' or (stage.get('utterance') or '').strip():
+        return 1
+    return 0
+
+
+def _mark_latest_attempts(orchestrations: List[Dict]):
+    """A later report wins. A later empty attempt does not erase an earlier report."""
+    best: Dict[str, Tuple[int, int]] = {}
+    for index, orch in enumerate(orchestrations):
+        for stage in orch.get('stages') or []:
+            name = stage.get('name') or ''
+            if not name:
+                continue
+            strength = _stage_strength(stage)
+            prev = best.get(name)
+            if prev is None or strength > prev[1] or (strength == prev[1] and index > prev[0]):
+                best[name] = (index, strength)
+    counts: Dict[str, int] = {}
+    for orch in orchestrations:
+        for stage in orch.get('stages') or []:
+            name = stage.get('name') or ''
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+    for index, orch in enumerate(orchestrations):
+        for stage in orch.get('stages') or []:
+            name = stage.get('name') or ''
+            winner = best.get(name, (None, 0))[0]
+            stage['superseded'] = bool(name) and winner is not None and winner != index
+            stage['latest_attempt'] = bool(name) and winner == index and counts.get(name, 0) > 1
+
+
+def enrich_orchestrations(parser) -> None:
+    """Fill crew items from child sessions. Safe to call once after the jsonl load."""
+    orchestrations = [item for item in parser.data if item.get('type') == 'orchestration']
+    if not orchestrations:
+        return
+    by_turn: Dict[int, List[Dict]] = defaultdict(list)
+    for item in orchestrations:
+        by_turn[int(item.get('turn') or 1)].append(item)
+    for items in by_turn.values():
+        for index, item in enumerate(items, start=1):
+            item['ordinal_in_turn'] = index
+            item['turn_orch_count'] = len(items)
+
+    sessions_dir = parser.entry.session_file.parent
+    children = _discover_stage_sessions(sessions_dir, parser.session_id)
+    filled, unmatched = _assign_stage_sessions(orchestrations, children)
+    failed_names = {}
+    for item in orchestrations:
+        detail = item.get('status_detail') or ''
+        match = _FAILED_STAGE_RE.search(detail)
+        failed_names[id(item)] = match.group(1) if match else (item.get('failed_stage') or '')
+
+    for orch, assigned in zip(orchestrations, filled):
+        names = [s.get('name') for s in orch.get('stage_specs') or []]
+        pipeline = split_pipeline_reports(orch.get('pipeline_text') or '', names)
+        failed_stage = failed_names.get(id(orch), '')
+        queues = {name: list(pairs) for name, pairs in assigned.items()}
+        stages = []
+        for spec in orch.get('stage_specs') or []:
+            stage = _blank_stage(spec)
+            name = spec.get('name') or '(unnamed)'
+            queue = queues.get(name) or []
+            report = pipeline.get(name, '')
+            if queue:
+                child, scan = queue.pop(0)
+                stage['session_id'] = child.get('id') or ''
+                stage['session_path'] = str(child.get('jsonl') or '')
+                stage['created_at'] = child.get('created_at') or ''
+                _apply_child_scan(stage, scan, report,
+                                  orch.get('crew_status') or 'running',
+                                  failed_stage == name)
+            else:
+                _apply_child_scan(stage, {}, report,
+                                  orch.get('crew_status') or 'running',
+                                  failed_stage == name)
+            stages.append(stage)
+        for name, queue in queues.items():
+            while queue:
+                child, scan = queue.pop(0)
+                stage = _blank_stage({'name': name or '(unnamed)'})
+                stage['session_id'] = child.get('id') or ''
+                stage['session_path'] = str(child.get('jsonl') or '')
+                _apply_child_scan(stage, scan, '', orch.get('crew_status') or 'running',
+                                  failed_stage == name)
+                stages.append(stage)
+        orch['stages'] = stages
+        orch.pop('pipeline_text', None)
+    if unmatched:
+        # A child we could not place still belongs to the nearest crew whose
+        # task matches. Park it on that crew so its last state is not dropped.
+        for child, stage_name, scan in unmatched:
+            host = None
+            for orch in orchestrations:
+                if _task_matches_title(orch.get('task') or '', child.get('title') or ''):
+                    host = orch
+                    break
+            if host is None:
+                continue
+            stage = _blank_stage({'name': stage_name or '(unassigned)'})
+            stage['session_id'] = child.get('id') or ''
+            stage['session_path'] = str(child.get('jsonl') or '')
+            _apply_child_scan(stage, scan, '', host.get('crew_status') or 'running', False)
+            host.setdefault('stages', []).append(stage)
+    _mark_latest_attempts(orchestrations)
+    for orch in orchestrations:
+        assemble_crew_parts(orch)
+
+
 def estimate_lines(item: Dict) -> int:
     t = item['type']
+    if t == 'orchestration':
+        lines, _chars = orchestration_metrics(item, default_orch_filter(), 0)
+        return lines
     if t in ('user_message', 'agent_message', 'reasoning', 'summarization'):
         c = item.get('content', '')
         return (c.count('\n') + 4) if c else 0
@@ -2898,47 +4383,403 @@ OUTPUT_SECTIONS = {'terminal_output', 'process_ctrl', 'web_fetch', 'file_read'}
 CAP_STEPS = [0, 1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30, 50, 100, 200, 500]
 MSG_CAP_STEPS = [0, 5] + list(range(10, 101, 10)) + [150, 200, 300, 500]
 
-def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> Tuple[Dict[str, bool], bool, int, int, int, int, int]:
+def _filter_row_specs() -> Tuple[List[Dict], int]:
+    specs: List[Dict] = []
+
+    def add(kind: str, key: str = '', name: str = '', emoji: str = ''):
+        specs.append({'kind': kind, 'key': key, 'name': name, 'emoji': emoji})
+
+    for key, name, emoji, _default in SECTION_DEFS:
+        add('section', key, name, emoji)
+        if key == 'orchestration':
+            for status_key, status_label in ORCH_STATUSES:
+                add('orch_status', status_key, status_label)
+            for layer_key, layer_label, _on in ORCH_LAYERS:
+                add('orch_layer', layer_key, layer_label)
+            add('orch_flag', 'latest_only', 'Latest attempt only')
+    add('sep')
+    add('clean', 'clean', 'Clean Chat', '✂️ ')
+    add('cap', 'output', 'Output cap', '📤')
+    add('cap', 'user', 'User message cap', '👤')
+    add('cap', 'agent', 'Agent message cap', '🤖')
+    add('cap', 'reason', 'Reasoning cap', '🧠')
+    add('cap', 'summary', 'Compaction summary cap', '✂️ ')
+    next_id = 0
+    for spec in specs:
+        if spec['kind'] == 'sep':
+            spec['id'] = None
+        else:
+            spec['id'] = next_id
+            next_id += 1
+    return specs, next_id
+
+
+FILTER_ROW_SPECS, FILTER_ROW_COUNT = _filter_row_specs()
+
+
+def _item_export_chars(item: Dict, output_cap: int) -> int:
+    t = item.get('type')
+    if t == 'terminal_output':
+        output = item.get('output') or ''
+        if not isinstance(output, str) or not output.strip():
+            return 0
+        total = text_line_count(output)
+        if output_cap > 0 and total > output_cap:
+            return int(len(output) * (output_cap / total)) + 48
+        return len(output) + 48
+    chars = 0
+    for key in ('content', 'output', 'command', 'prompt', 'response', 'modified_content',
+                'original_content', 'message', 'query', 'explanation', 'url'):
+        value = item.get(key)
+        if isinstance(value, str):
+            chars += len(value)
+    return chars + 24
+
+
+def compute_filter_metrics(parsers, orch_filter: Dict, output_cap: int,
+                           user_cap: int, agent_cap: int, reason_cap: int,
+                           summary_cap: int) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int], Dict]:
+    """Line and character totals for the filter screen."""
+    counts = {s[0]: 0 for s in SECTION_DEFS}
+    char_counts = {s[0]: 0 for s in SECTION_DEFS}
+    msg_counts: Dict[str, int] = {}
+    caps_map = {
+        'user_message': user_cap,
+        'agent_message': agent_cap,
+        'reasoning': reason_cap,
+        'summarization': summary_cap,
+    }
+    for parser in parsers or []:
+        keep = set(range(len(parser.data)))
+        seen = {key: 0 for key in caps_map}
+        for index in range(len(parser.data) - 1, -1, -1):
+            kind = parser.data[index].get('type')
+            if kind in caps_map and caps_map[kind] > 0:
+                if seen[kind] >= caps_map[kind]:
+                    keep.discard(index)
+                seen[kind] += 1
+        for index, item in enumerate(parser.data):
+            if index not in keep:
+                continue
+            kind = item.get('type')
+            if kind == 'orchestration':
+                continue
+            if kind in ('user_message', 'agent_message', 'reasoning', 'summarization'):
+                msg_counts[kind] = msg_counts.get(kind, 0) + 1
+            lines = estimate_lines(item)
+            chars = _item_export_chars(item, output_cap)
+            if kind == 'terminal_output' and output_cap > 0:
+                output = item.get('output') or ''
+                if isinstance(output, str):
+                    total = output.count('\n') + 1 if output.strip() else 0
+                    lines = min(total, output_cap) + 3 if total > 0 else 0
+            counts[kind] = counts.get(kind, 0) + lines
+            char_counts[kind] = char_counts.get(kind, 0) + chars
+        if getattr(parser, 'metadata', None):
+            counts['session_meta'] = counts.get('session_meta', 0) + 7
+            char_counts['session_meta'] = char_counts.get('session_meta', 0) + 180
+    account = orchestration_accounting(parsers, orch_filter, output_cap)
+    counts['orchestration'] = account['selected_lines']
+    char_counts['orchestration'] = account['selected_chars']
+    return counts, char_counts, msg_counts, account
+
+
+def _goto_col(col: int) -> str:
+    return f'\033[{int(col)}G'
+
+
+def _paint(text: str, *styles: str) -> str:
+    if not text:
+        return ''
+    if not styles:
+        return text
+    return ''.join(styles) + text + Style.RESET
+
+
+def _token_body(tokens: int) -> str:
+    """Fixed shape `~###### tok` so every row's token figure is the same width."""
+    num = format_tokens(tokens)
+    if len(num) < 6:
+        num = num.rjust(6)
+    return f'~{num} tok'
+
+
+def _filter_table_columns(width: int, lines_w: int, tokens_w: int) -> Dict:
+    """Absolute 1-based columns for the section filter.
+
+    Emoji are not one display width, and a label's length used to push the
+    line and token figures to a different place on every row. Later fields
+    are placed with cursor addressing so a wide glyph cannot move them.
+    """
+    width = max(48, int(width or 100))
+    last = width - 1
+    lines_w = max(8, int(lines_w))
+    tokens_w = max(len('~ TOKENS'), int(tokens_w))
+    name_col = 11
+    span = last - name_col + 1
+    gap_name, gap_tok, gap_note = 2, 1, 2
+    tail = gap_name + lines_w + gap_tok + tokens_w
+    name_w = 24
+    note_w = span - name_w - tail - gap_note
+    if note_w < 10:
+        name_w = max(22, min(24, span - tail))
+        note_w = span - name_w - tail - gap_note
+    if note_w < 0:
+        name_w = max(12, span - tail)
+        note_w = 0
+    if name_w + tail > span:
+        name_w = max(8, span - tail)
+        note_w = 0
+    lines_col = name_col + name_w + gap_name
+    tokens_col = lines_col + lines_w + gap_tok
+    note_col = tokens_col + tokens_w + gap_note if note_w > 0 else 0
+    return {
+        'arrow': 3,
+        'toggle': 5,
+        'emoji': 8,
+        'name': name_col,
+        'name_w': name_w,
+        'lines': lines_col,
+        'lines_w': lines_w,
+        'tokens': tokens_col,
+        'tokens_w': tokens_w,
+        'note': note_col,
+        'note_w': max(0, note_w),
+        'last': last,
+        'width': width,
+    }
+
+
+def _filter_line(pieces: List[Tuple[int, str]]) -> str:
+    parts = []
+    for col, text in pieces:
+        if col and text:
+            parts.append(_goto_col(col) + text)
+    return ''.join(parts)
+
+
+# Status, layer, and latest-attempt rows belong to the Orchestrations section.
+_ORCH_SUB_KINDS = ('orch_status', 'orch_layer', 'orch_flag')
+
+
+def render_filter_column_head(cols: Dict) -> str:
+    return _filter_line([
+        (cols['lines'], _paint('LINES'.rjust(cols['lines_w']), Style.DIM)),
+        (cols['tokens'], _paint('~ TOKENS'.ljust(cols['tokens_w']), Style.DIM)),
+    ])
+
+
+def render_filter_rows(
+    specs,
+    cursor: int,
+    fstate: Dict[str, bool],
+    orch_filter: Dict,
+    agg: Dict[str, int],
+    char_counts: Dict[str, int],
+    msg_cnt: Dict[str, int],
+    account: Dict,
+    clean_content: bool,
+    cap_display: Dict[str, int],
+    width: int,
+    sel_lines: int = 0,
+    total_lines: int = 0,
+    sel_tokens: int = 0,
+    total_tokens: int = 0,
+) -> Tuple[List[Tuple[Optional[int], str]], Dict]:
+    """One filter row per spec. Line and token figures share fixed columns."""
+    account = account or {}
+    by_status = account.get('by_status') or {}
+    by_layer = account.get('by_layer') or {}
+    by_crews = account.get('by_status_crews') or {}
+    orch_on = bool(fstate.get('orchestration', False))
+    prepared = []
+    line_widths = [len(f'{int(sel_lines):,}'), len(f'{int(total_lines):,}')]
+    token_widths = [len(_token_body(sel_tokens)), len(_token_body(total_tokens))]
+
+    for spec in specs:
+        kind = spec['kind']
+        if kind == 'sep':
+            prepared.append({'sep': True})
+            continue
+        is_sub = kind in _ORCH_SUB_KINDS
+        lines = 0
+        tokens = 0
+        note = ''
+        metric = kind in ('section', 'orch_status', 'orch_layer')
+        cap_text = ''
+        if kind == 'section':
+            key = spec['key']
+            is_on = bool(fstate.get(key, False))
+            lines = int(agg.get(key, 0) or 0)
+            tokens = estimate_tokens(int(char_counts.get(key, 0) or 0))
+            counted = int(msg_cnt.get(key) or 0)
+            if key in ('user_message', 'agent_message', 'reasoning', 'summarization') and counted:
+                note = '1 msg' if counted == 1 else f'{counted:,} msgs'
+            elif key == 'orchestration' and account.get('crews'):
+                crews = int(account.get('crews') or 0)
+                stages = int(account.get('stages') or 0)
+                note = '1 crew' if crews == 1 else f'{crews:,} crews'
+                if stages:
+                    note += ' · 1 stage' if stages == 1 else f' · {stages:,} stages'
+        elif kind == 'orch_status':
+            is_on = bool((orch_filter.get('statuses') or {}).get(spec['key']))
+            info = by_status.get(spec['key']) or {}
+            lines = int(info.get('lines') or 0)
+            tokens = int(info.get('tokens') or 0)
+            n_crews = int(by_crews.get(spec['key']) or 0)
+            if n_crews:
+                note = '1 crew' if n_crews == 1 else f'{n_crews:,} crews'
+        elif kind == 'orch_layer':
+            is_on = bool((orch_filter.get('layers') or {}).get(spec['key']))
+            info = by_layer.get(spec['key']) or {}
+            lines = int(info.get('lines') or 0)
+            tokens = int(info.get('tokens') or 0)
+        elif kind == 'orch_flag':
+            is_on = bool(orch_filter.get('latest_only'))
+            note = 'hides older attempts'
+        elif kind == 'clean':
+            is_on = bool(clean_content)
+            note = 'strip IDE context'
+        else:
+            is_on = True
+            value = int(cap_display.get(spec['key'], 0) or 0)
+            if not value:
+                cap_text = 'ALL'
+            elif spec['key'] == 'output':
+                cap_text = str(value)
+            else:
+                cap_text = f'Last {value}'
+            if spec.get('id') == cursor:
+                note = '◀▶'
+        prepared.append({
+            'spec': spec,
+            'is_sub': is_sub,
+            'is_on': is_on,
+            'lines': lines,
+            'tokens': tokens,
+            'note': note,
+            'metric': metric,
+            'cap_text': cap_text,
+        })
+        if metric:
+            line_widths.append(len(f'{lines:,}'))
+            token_widths.append(len(_token_body(tokens)))
+        elif cap_text:
+            line_widths.append(len(cap_text))
+
+    cols = _filter_table_columns(width, max(line_widths or [8]), max(token_widths or [11]))
+    rows: List[Tuple[Optional[int], str]] = []
+    rule = _paint('─' * max(8, cols['last'] - 2), Style.DIM)
+
+    for item in prepared:
+        if item.get('sep'):
+            rows.append((None, _filter_line([(3, rule)])))
+            continue
+        spec = item['spec']
+        kind = spec['kind']
+        rid = spec.get('id')
+        is_cursor = rid == cursor
+        is_on = item['is_on']
+        is_sub = item['is_sub']
+        quiet = (is_sub and not orch_on) or not is_on
+        pieces: List[Tuple[int, str]] = []
+        if is_cursor:
+            pieces.append((cols['arrow'], _paint('▸', Style.BOLD, Style.YELLOW)))
+        if kind != 'cap':
+            toggle = _paint('██', Style.GREEN) if is_on else _paint('░░', Style.DIM)
+            pieces.append((cols['toggle'], toggle))
+        glyph = (spec.get('emoji') or '').strip()
+        if glyph and not is_sub:
+            if quiet and not is_cursor and kind != 'cap':
+                pieces.append((cols['emoji'], _paint(glyph, Style.DIM)))
+            else:
+                pieces.append((cols['emoji'], glyph))
+        if kind == 'cap':
+            name_styles = (Style.BOLD,) if is_cursor else (Style.DIM,)
+        elif is_cursor and is_on:
+            name_styles = (Style.BOLD, Style.GREEN)
+        elif is_cursor:
+            name_styles = (Style.BOLD, Style.RED)
+        elif quiet:
+            name_styles = (Style.DIM,)
+        else:
+            name_styles = ()
+        label = spec.get('name') or ''
+        if is_sub:
+            # One column before the shared name, so the mark sits against the
+            # sub-option and the words still start in the name column.
+            mark_style = (Style.BOLD, Style.YELLOW) if is_cursor else (Style.DIM,)
+            pieces.append((cols['name'] - 2, _paint('↳', *mark_style)))
+        pieces.append((cols['name'], _paint(_clip(label, cols['name_w']), *name_styles)))
+        if item['metric']:
+            count_style = (Style.DIM,) if quiet else (Style.CYAN,)
+            pieces.append((
+                cols['lines'],
+                _paint(f"{item['lines']:,}".rjust(cols['lines_w']), *count_style),
+            ))
+            pieces.append((
+                cols['tokens'],
+                _paint(_token_body(item['tokens']).ljust(cols['tokens_w']), *count_style),
+            ))
+        elif item['cap_text']:
+            if is_cursor:
+                value_style = (Style.BOLD, Style.YELLOW)
+            elif item['cap_text'] == 'ALL':
+                value_style = (Style.DIM,)
+            else:
+                value_style = (Style.YELLOW,)
+            pieces.append((
+                cols['lines'],
+                _paint(item['cap_text'].rjust(cols['lines_w']), *value_style),
+            ))
+        if item['note'] and cols['note_w']:
+            pieces.append((cols['note'], _paint(_clip(item['note'], cols['note_w']), Style.DIM)))
+        rows.append((rid, _filter_line(pieces)))
+    return rows, cols
+
+
+def render_filter_footer(cols: Dict, sel_lines: int, total_lines: int,
+                         sel_tokens: int, total_tokens: int, pct: float) -> List[str]:
+    """Selected and overall figures in the same columns as the rows."""
+    def figures(lines: int, tokens: int, *styles: str) -> List[Tuple[int, str]]:
+        return [
+            (cols['lines'], _paint(f'{int(lines):,}'.rjust(cols['lines_w']), *styles)),
+            (cols['tokens'], _paint(_token_body(tokens).ljust(cols['tokens_w']), *styles)),
+        ]
+
+    sel_style = (Style.GREEN, Style.BOLD) if pct > 0 else (Style.RED, Style.BOLD)
+    top: List[Tuple[int, str]] = []
+    # Sit the bar in the blank name area, ending one column before the figures.
+    bar_w = min(24, cols['lines'] - 4)
+    if bar_w >= 8:
+        filled = int(bar_w * max(0.0, min(100.0, pct)) / 100)
+        bar = _paint('█' * filled, Style.GREEN) + _paint('░' * (bar_w - filled), Style.DIM)
+        top.append((cols['lines'] - bar_w - 1, bar))
+    top.extend(figures(sel_lines, sel_tokens, *sel_style))
+    bottom = figures(total_lines, total_tokens, Style.DIM)
+    if cols['note_w']:
+        top.append((cols['note'], _paint(_clip(f'selected · {pct:.0f}%', cols['note_w']), Style.DIM)))
+        bottom.append((cols['note'], _paint(_clip('all sections', cols['note_w']), Style.DIM)))
+    rule = _filter_line([(3, _paint('━' * max(8, cols['last'] - 2), Style.DIM))])
+    return [rule, _filter_line(top), _filter_line(bottom)]
+
+
+def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> Tuple[Dict[str, bool], bool, int, int, int, int, int, Dict]:
     _line_cache: Dict = {}
 
-    def get_lines(cap_out, cap_user, cap_agent, cap_reason, cap_sum, cc):
-        key = (cap_out, cap_user, cap_agent, cap_reason, cap_sum, cc)
+    def get_lines(cap_out, cap_user, cap_agent, cap_reason, cap_sum, orch_key):
+        key = (cap_out, cap_user, cap_agent, cap_reason, cap_sum, orch_key)
         if key in _line_cache:
             return _line_cache[key]
-        counts = {s[0]: 0 for s in SECTION_DEFS}
-        msg_counts: Dict[str, int] = {}
-        for p in parsers:
-            keep_indices = set(range(len(p.data)))
-            counters = {'u': 0, 'a': 0, 'r': 0, 's': 0}
-            caps_map = {'user_message': cap_user, 'agent_message': cap_agent,
-                        'reasoning': cap_reason, 'summarization': cap_sum}
-            sym = {'user_message': 'u', 'agent_message': 'a', 'reasoning': 'r', 'summarization': 's'}
-            for i in range(len(p.data) - 1, -1, -1):
-                t = p.data[i]['type']
-                if t in caps_map and caps_map[t] > 0:
-                    s = sym[t]
-                    if counters[s] >= caps_map[t]:
-                        keep_indices.discard(i)
-                    counters[s] += 1
-            for i, it in enumerate(p.data):
-                if i not in keep_indices:
-                    continue
-                t = it['type']
-                if t in ('user_message', 'agent_message', 'reasoning', 'summarization'):
-                    msg_counts[t] = msg_counts.get(t, 0) + 1
-                lines = estimate_lines(it)
-                if t == 'terminal_output' and cap_out > 0:
-                    o = it.get('output', '') or ''
-                    if isinstance(o, str):
-                        total = o.count('\n') + 1 if o.strip() else 0
-                        lines = min(total, cap_out) + 3 if total > 0 else 0
-                counts[t] = counts.get(t, 0) + lines
-            if p.metadata:
-                counts['session_meta'] = counts.get('session_meta', 0) + 7
-        _line_cache[key] = (counts, msg_counts)
-        return counts, msg_counts
+        counts, char_counts, msg_counts, account = compute_filter_metrics(
+            parsers, orch_filter, cap_out, cap_user, cap_agent, cap_reason, cap_sum,
+        )
+        packed = (counts, char_counts, msg_counts, account)
+        _line_cache[key] = packed
+        return packed
 
     fstate: Dict[str, bool] = {s[0]: s[3] for s in SECTION_DEFS}
+    orch_filter = default_orch_filter()
     clean_content = False
     output_cap = 8;  cap_idx = CAP_STEPS.index(8)
     user_cap = 0;    u_idx = 0
@@ -2947,13 +4788,9 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
     summary_cap = 0; s_idx = 0
 
     cursor = 0
-    ROW_CLEAN   = len(SECTION_DEFS)
-    ROW_CAP     = len(SECTION_DEFS) + 1
-    ROW_USER    = len(SECTION_DEFS) + 2
-    ROW_AGENT   = len(SECTION_DEFS) + 3
-    ROW_REASON  = len(SECTION_DEFS) + 4
-    ROW_SUMMARY = len(SECTION_DEFS) + 5
-    num_items   = len(SECTION_DEFS) + 6
+    specs = FILTER_ROW_SPECS
+    num_items = FILTER_ROW_COUNT
+    spec_by_id = {spec['id']: spec for spec in specs if spec.get('id') is not None}
 
     import shutil as _shutil
 
@@ -2967,80 +4804,56 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
 
     scroll_offset = 0
 
+    def _reset_orch():
+        fresh = default_orch_filter()
+        orch_filter['statuses'].clear()
+        orch_filter['statuses'].update(fresh['statuses'])
+        orch_filter['layers'].clear()
+        orch_filter['layers'].update(fresh['layers'])
+        orch_filter['latest_only'] = False
+
+    def _orch_key():
+        return (
+            tuple(key for key, _label in ORCH_STATUSES if orch_filter['statuses'].get(key)),
+            tuple(key for key, _label, _on in ORCH_LAYERS if orch_filter['layers'].get(key)),
+            bool(orch_filter.get('latest_only')),
+        )
+
     try:
         while True:
-            agg, msg_cnt = get_lines(output_cap, user_cap, agent_cap, reason_cap, summary_cap, clean_content)
+            agg, char_counts, msg_cnt, account = get_lines(
+                output_cap, user_cap, agent_cap, reason_cap, summary_cap, _orch_key(),
+            )
             total_lines = sum(agg.get(s[0], 0) for s in SECTION_DEFS)
+            total_chars = sum(char_counts.get(s[0], 0) for s in SECTION_DEFS)
             sel_lines = sum(agg.get(s[0], 0) for s in SECTION_DEFS if fstate.get(s[0], False))
+            sel_chars = sum(char_counts.get(s[0], 0) for s in SECTION_DEFS if fstate.get(s[0], False))
             pct = (sel_lines / total_lines * 100) if total_lines > 0 else 0
 
-            # --- Build the LIST of navigable / decorative middle rows ----
-            # Each entry is (cursor_id_or_None, rendered_text).
-            mid_rows: List[Tuple[Optional[int], str]] = []
+            cap_display = {
+                'output': output_cap,
+                'user': user_cap,
+                'agent': agent_cap,
+                'reason': reason_cap,
+                'summary': summary_cap,
+            }
+            term_size = _shutil.get_terminal_size((100, 30))
+            term_w = max(48, term_size.columns)
+            term_h = max(12, term_size.lines)
+            sel_tokens = estimate_tokens(sel_chars)
+            total_tokens = estimate_tokens(total_chars)
+            mid_rows, cols = render_filter_rows(
+                specs, cursor, fstate, orch_filter, agg, char_counts, msg_cnt, account,
+                clean_content, cap_display, term_w,
+                sel_lines=sel_lines, total_lines=total_lines,
+                sel_tokens=sel_tokens, total_tokens=total_tokens,
+            )
 
-            for i, (key, name, emoji, _default) in enumerate(SECTION_DEFS):
-                is_cursor = (i == cursor)
-                is_on = fstate.get(key, False)
-                lines = agg.get(key, 0)
-                arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if is_cursor else ' '
-                toggle = f'{Style.GREEN}██{Style.RESET}' if is_on else f'{Style.DIM}░░{Style.RESET}'
-                if is_cursor and is_on:    nstyle = f'{Style.BOLD}{Style.GREEN}'
-                elif is_cursor and not is_on: nstyle = f'{Style.BOLD}{Style.RED}'
-                elif is_on:                nstyle = ''
-                else:                      nstyle = Style.DIM
-                msg_n = msg_cnt.get(key, 0)
-                extra = (f' {Style.DIM}({msg_n:,} Msg){Style.RESET}'
-                         if key in ('user_message','agent_message','reasoning','summarization') and msg_n > 0
-                         else '')
-                count_str = (f'{Style.CYAN}{lines:>6,}{Style.RESET}'
-                             if is_on and lines > 0 else f'{Style.DIM}{lines:>6,}{Style.RESET}')
-                if lines == 0:
-                    count_str = f'{Style.DIM}     0{Style.RESET}'
-                visible = f'{emoji} {name}'
-                pad = max(1, 44 - len(visible))
-                dots = f'{Style.DIM}{"·" * pad}{Style.RESET}'
-                mid_rows.append((i,
-                    f'  {arrow} {toggle} {nstyle}{visible}{Style.RESET} {dots} {count_str}{extra}'))
-
-            # Visual separator between sections and caps
-            mid_rows.append((None, f'  {Style.DIM}{"─" * 62}{Style.RESET}'))
-
-            # Clean Chat
-            cc_cur = (cursor == ROW_CLEAN)
-            cc_arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if cc_cur else ' '
-            cc_tog = f'{Style.GREEN}██{Style.RESET}' if clean_content else f'{Style.DIM}░░{Style.RESET}'
-            cc_st = f'{Style.BOLD}' if cc_cur else Style.DIM
-            cc_val = f'{Style.GREEN}ON {Style.RESET}' if clean_content else f'{Style.DIM}OFF{Style.RESET}'
-            mid_rows.append((ROW_CLEAN,
-                f'  {cc_arrow} {cc_tog} {cc_st}✂️  Clean Chat{Style.RESET} {Style.DIM}(strip IDE context from 👤🤖){Style.RESET}  {cc_val}'))
-
-            def _caprow(row_id, label_emoji, label_text, value):
-                cur = (cursor == row_id)
-                arrow = f'{Style.BOLD}{Style.YELLOW}▸{Style.RESET}' if cur else ' '
-                st = f'{Style.BOLD}' if cur else Style.DIM
-                val = f'{Style.DIM}ALL{Style.RESET}' if value == 0 else f'{Style.YELLOW}{value}{Style.RESET}'
-                hint = f' {Style.DIM}◀▶{Style.RESET}' if cur else ''
-                return (row_id, f'  {arrow}    {st}{label_emoji} {label_text}{Style.RESET} {val}{hint}')
-
-            mid_rows.append(_caprow(ROW_CAP,    '📤', 'Terminal Output Cap     ', output_cap))
-            mid_rows.append(_caprow(ROW_USER,   '👤', 'User Message Cap        ', f'Last {user_cap}' if user_cap else 0))
-            mid_rows.append(_caprow(ROW_AGENT,  '🤖', 'Agent Message Cap       ', f'Last {agent_cap}' if agent_cap else 0))
-            mid_rows.append(_caprow(ROW_REASON, '🧠', 'Reasoning Cap           ', f'Last {reason_cap}' if reason_cap else 0))
-            mid_rows.append(_caprow(ROW_SUMMARY,'✂️ ', 'Compaction Summary Cap  ', f'Last {summary_cap}' if summary_cap else 0))
-
-            # --- Viewport math ----------------------------------------------
-            term_size = _shutil.get_terminal_size((80, 30))
-            term_h = max(10, term_size.lines)
-            # Fixed-size header (3 lines: blank + title + separator) +
-            # fixed-size footer (separator + progress bar + hint + 1 cushion).
-            # Plus 2 lines reserved for ▲/▼ markers so the layout never jumps.
             HEADER_LINES = 3
-            FOOTER_LINES = 5
+            FOOTER_LINES = 6
             INDICATOR_LINES = 2
             view_h = max(5, term_h - HEADER_LINES - FOOTER_LINES - INDICATOR_LINES)
-
-            # Find cursor's index in mid_rows and scroll viewport so it's visible
-            cur_pos = next((idx for idx, (rid, _) in enumerate(mid_rows) if rid == cursor), 0)
+            cur_pos = next((idx for idx, (row_id, _) in enumerate(mid_rows) if row_id == cursor), 0)
             if cur_pos < scroll_offset:
                 scroll_offset = cur_pos
             elif cur_pos >= scroll_offset + view_h:
@@ -3048,78 +4861,93 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
             max_offset = max(0, len(mid_rows) - view_h)
             scroll_offset = max(0, min(scroll_offset, max_offset))
 
-            # --- Compose frame ----------------------------------------------
-            out = ['\033[H\033[2J']  # home + clear (alt-screen surface)
+            out = ['\033[H\033[2J']
             label = f"{len(parsers)} session{'s' if len(parsers) > 1 else ''}"
             if scope_label:
                 label += f" · {scope_label}"
             out.append(f"  {Style.BOLD}{Style.HEADER}KIRO SECTION FILTER{Style.RESET}  {Style.DIM}({label}){Style.RESET}")
-            out.append(f"  {Style.DIM}{'━' * 62}{Style.RESET}")
-            out.append('')
-
-            # ▲ indicator (always reserve the line — keeps row positions stable)
+            rule = _paint('━' * max(8, cols['last'] - 2), Style.DIM)
+            out.append(_filter_line([(3, rule)]))
+            out.append(render_filter_column_head(cols))
             if scroll_offset > 0:
-                out.append(f'  {Style.DIM}▲ {scroll_offset} more above{Style.RESET}')
+                out.append(_filter_line([(3, _paint(f'▲ {scroll_offset} more above', Style.DIM))]))
             else:
                 out.append('')
-
-            # Viewport slice
             for _rid, text in mid_rows[scroll_offset:scroll_offset + view_h]:
                 out.append(text)
-
-            # ▼ indicator
             below = max(0, len(mid_rows) - (scroll_offset + view_h))
             if below > 0:
-                out.append(f'  {Style.DIM}▼ {below} more below{Style.RESET}')
+                out.append(_filter_line([(3, _paint(f'▼ {below} more below', Style.DIM))]))
             else:
                 out.append('')
-
-            # Footer: separator + progress + hint
-            out.append(f'  {Style.DIM}{"━" * 62}{Style.RESET}')
-            bar_w = 30
-            filled = int(bar_w * pct / 100)
-            bar = f'{Style.GREEN}{"█" * filled}{Style.DIM}{"░" * (bar_w - filled)}{Style.RESET}'
-            sel_c = Style.GREEN if pct > 0 else Style.RED
-            out.append(f'  {bar}  {sel_c}{Style.BOLD}{sel_lines:,}{Style.RESET}{Style.DIM}/{Style.RESET}{total_lines:,}  {Style.DIM}({pct:.0f}%){Style.RESET}')
-            out.append(f'  {Style.DIM}↑↓ move  ⏎ toggle  ◀▶ cap  Q export  A all  N none  D defaults  1-7 presets{Style.RESET}')
-
+            out.extend(render_filter_footer(
+                cols, sel_lines, total_lines, sel_tokens, total_tokens, pct,
+            ))
+            out.append(_filter_line([(3, _paint(
+                '↑↓ move   ⏎ toggle   ◀▶ cap   Q export   A all   N none   D defaults   1-7 presets',
+                Style.DIM))]))
             sys.stdout.write('\n'.join(out))
             sys.stdout.flush()
 
             key = read_key()
-            if key == 'UP': cursor = (cursor - 1) % num_items
-            elif key == 'DOWN': cursor = (cursor + 1) % num_items
-            elif key in ('ENTER','SPACE'):
-                if cursor < len(SECTION_DEFS):
-                    fstate[SECTION_DEFS[cursor][0]] = not fstate[SECTION_DEFS[cursor][0]]
-                elif cursor == ROW_CLEAN:
+            spec = spec_by_id.get(cursor)
+            if key == 'UP':
+                cursor = (cursor - 1) % num_items
+            elif key == 'DOWN':
+                cursor = (cursor + 1) % num_items
+            elif key in ('ENTER', 'SPACE') and spec:
+                if spec['kind'] == 'section':
+                    fstate[spec['key']] = not fstate.get(spec['key'], False)
+                elif spec['kind'] == 'orch_status':
+                    orch_filter['statuses'][spec['key']] = not orch_filter['statuses'].get(spec['key'], False)
+                elif spec['kind'] == 'orch_layer':
+                    orch_filter['layers'][spec['key']] = not orch_filter['layers'].get(spec['key'], False)
+                elif spec['kind'] == 'orch_flag':
+                    orch_filter['latest_only'] = not bool(orch_filter.get('latest_only'))
+                elif spec['kind'] == 'clean':
                     clean_content = not clean_content
-            elif key == 'LEFT':
-                if cursor == ROW_CAP: cap_idx = max(0, cap_idx - 1); output_cap = CAP_STEPS[cap_idx]
-                elif cursor == ROW_USER: u_idx = max(0, u_idx - 1); user_cap = MSG_CAP_STEPS[u_idx]
-                elif cursor == ROW_AGENT: a_idx = max(0, a_idx - 1); agent_cap = MSG_CAP_STEPS[a_idx]
-                elif cursor == ROW_REASON: r_idx = max(0, r_idx - 1); reason_cap = MSG_CAP_STEPS[r_idx]
-                elif cursor == ROW_SUMMARY: s_idx = max(0, s_idx - 1); summary_cap = MSG_CAP_STEPS[s_idx]
-            elif key == 'RIGHT':
-                if cursor == ROW_CAP: cap_idx = min(len(CAP_STEPS) - 1, cap_idx + 1); output_cap = CAP_STEPS[cap_idx]
-                elif cursor == ROW_USER: u_idx = min(len(MSG_CAP_STEPS) - 1, u_idx + 1); user_cap = MSG_CAP_STEPS[u_idx]
-                elif cursor == ROW_AGENT: a_idx = min(len(MSG_CAP_STEPS) - 1, a_idx + 1); agent_cap = MSG_CAP_STEPS[a_idx]
-                elif cursor == ROW_REASON: r_idx = min(len(MSG_CAP_STEPS) - 1, r_idx + 1); reason_cap = MSG_CAP_STEPS[r_idx]
-                elif cursor == ROW_SUMMARY: s_idx = min(len(MSG_CAP_STEPS) - 1, s_idx + 1); summary_cap = MSG_CAP_STEPS[s_idx]
+            elif key in ('LEFT', 'RIGHT') and spec and spec['kind'] == 'cap':
+                step = -1 if key == 'LEFT' else 1
+                cap_key = spec['key']
+                if cap_key == 'output':
+                    cap_idx = min(len(CAP_STEPS) - 1, max(0, cap_idx + step))
+                    output_cap = CAP_STEPS[cap_idx]
+                elif cap_key == 'user':
+                    u_idx = min(len(MSG_CAP_STEPS) - 1, max(0, u_idx + step))
+                    user_cap = MSG_CAP_STEPS[u_idx]
+                elif cap_key == 'agent':
+                    a_idx = min(len(MSG_CAP_STEPS) - 1, max(0, a_idx + step))
+                    agent_cap = MSG_CAP_STEPS[a_idx]
+                elif cap_key == 'reason':
+                    r_idx = min(len(MSG_CAP_STEPS) - 1, max(0, r_idx + step))
+                    reason_cap = MSG_CAP_STEPS[r_idx]
+                elif cap_key == 'summary':
+                    s_idx = min(len(MSG_CAP_STEPS) - 1, max(0, s_idx + step))
+                    summary_cap = MSG_CAP_STEPS[s_idx]
             elif key == 'A':
-                for s in SECTION_DEFS: fstate[s[0]] = True
+                for s in SECTION_DEFS:
+                    fstate[s[0]] = True
             elif key == 'N':
-                for s in SECTION_DEFS: fstate[s[0]] = False
+                for s in SECTION_DEFS:
+                    fstate[s[0]] = False
             elif key == 'I':
-                for s in SECTION_DEFS: fstate[s[0]] = not fstate[s[0]]
+                for s in SECTION_DEFS:
+                    fstate[s[0]] = not fstate[s[0]]
             elif key == 'D':
-                for s in SECTION_DEFS: fstate[s[0]] = s[3]
+                for s in SECTION_DEFS:
+                    fstate[s[0]] = s[3]
+                _reset_orch()
                 clean_content = False
-                output_cap = 8; cap_idx = CAP_STEPS.index(8)
-                user_cap = 0; u_idx = 0
-                agent_cap = 0; a_idx = 0
-                reason_cap = 0; r_idx = 0
-                summary_cap = 0; s_idx = 0
+                output_cap = 8
+                cap_idx = CAP_STEPS.index(8)
+                user_cap = 0
+                u_idx = 0
+                agent_cap = 0
+                a_idx = 0
+                reason_cap = 0
+                r_idx = 0
+                summary_cap = 0
+                s_idx = 0
             elif key == 'Q' or key == 'ESC':
                 break
             elif key.isdigit():
@@ -3127,16 +4955,17 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                 if 0 <= pi < len(FILTER_PRESETS):
                     _pname, pkeys, pclean = FILTER_PRESETS[pi]
                     if pkeys is None:
-                        for s in SECTION_DEFS: fstate[s[0]] = s[3]
+                        for s in SECTION_DEFS:
+                            fstate[s[0]] = s[3]
+                        _reset_orch()
                     else:
-                        for s in SECTION_DEFS: fstate[s[0]] = s[0] in pkeys
+                        for s in SECTION_DEFS:
+                            fstate[s[0]] = s[0] in pkeys
                     clean_content = pclean
     finally:
-        # Restore cursor and leave the alt screen. The terminal pops back to
-        # whatever was on the main screen before we entered.
         sys.stdout.write('\033[?25h\033[?1049l')
         sys.stdout.flush()
-    return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap
+    return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap, orch_filter
 
 # ──────────────────────────────────────────────────────────────
 # Extraction scope
@@ -3257,7 +5086,8 @@ def combine_parsers_to_markdown(parsers: List['SessionParser'],
                                 clean_content: bool,
                                 output_cap: int,
                                 user_cap: int, agent_cap: int,
-                                reasoning_cap: int, summary_cap: int) -> Tuple[str, str]:
+                                reasoning_cap: int, summary_cap: int,
+                                orch_filter: Optional[Dict] = None) -> Tuple[str, str]:
     """Build a single Markdown document containing every parser's output, with
     clear `## ▶ Session N of K` dividers between them. Returns (md, filename)."""
     parts: List[str] = []
@@ -3315,6 +5145,7 @@ def combine_parsers_to_markdown(parsers: List['SessionParser'],
             agent_cap=agent_cap,
             reasoning_cap=reasoning_cap,
             summary_cap=summary_cap,
+            orch_filter=orch_filter,
         )
         # Drop the per-session H1 — we already have a chain title
         body_lines = body.splitlines()
@@ -3469,7 +5300,7 @@ def print_menu_header(workspace_filter: Optional[str], total_sessions: int,
                       source_label: str = "Kiro IDE",
                       storage_path: Optional[Path] = None):
     _clear_screen()
-    print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}v1.2.3 · {source_label}{Style.RESET}")
+    print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}v1.3.0 · {source_label}{Style.RESET}")
     print(f"{Style.DIM}Storage:   {storage_path or KIRO_HOME}{Style.RESET}")
     try:
         out = Path(__file__).parent.resolve()
@@ -3993,7 +5824,12 @@ def _parse_sessions_parallel(entries: List['SessionEntry'], max_workers: int = 6
 def merge_chain_to_markdown(chain: 'Chain',
                             section_filter: Dict[str, bool],
                             clean_content: bool = False,
-                            output_cap: int = 0) -> Tuple[str, str]:
+                            output_cap: int = 0,
+                            orch_filter: Optional[Dict] = None,
+                            user_cap: int = 0,
+                            agent_cap: int = 0,
+                            reasoning_cap: int = 0,
+                            summary_cap: int = 0) -> Tuple[str, str]:
     """Concatenate every session in a chain into one Markdown document.
     Returns (markdown, filename)."""
     parts: List[str] = []
@@ -4056,7 +5892,12 @@ def merge_chain_to_markdown(chain: 'Chain',
         # Render the session inline (skip title — we already have a chain title)
         body = parser.to_markdown(section_filter=section_filter,
                                   clean_content=clean_content,
-                                  output_cap=output_cap)
+                                  output_cap=output_cap,
+                                  user_cap=user_cap,
+                                  agent_cap=agent_cap,
+                                  reasoning_cap=reasoning_cap,
+                                  summary_cap=summary_cap,
+                                  orch_filter=orch_filter)
         # Strip body's H1 since we used our own
         body_lines = body.splitlines()
         if body_lines and body_lines[0].startswith('# '):
@@ -4094,7 +5935,7 @@ def process_chain_export(chain: 'Chain'):
     if not parsers:
         return
     # Reuse the interactive filter UI so options match per-session export
-    section_filter, clean_content, output_cap, *_caps = interactive_filter(
+    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap, orch_filter = interactive_filter(
         parsers, scope_label=f"chain {chain.id}"
     )
     if not any(section_filter.values()):
@@ -4102,7 +5943,11 @@ def process_chain_export(chain: 'Chain'):
         input(f"\n{Style.DIM}Press Enter to continue...{Style.RESET}")
         return
 
-    md, fname = merge_chain_to_markdown(chain, section_filter, clean_content, output_cap)
+    md, fname = merge_chain_to_markdown(
+        chain, section_filter, clean_content, output_cap, orch_filter,
+        user_cap=user_cap, agent_cap=agent_cap,
+        reasoning_cap=reason_cap, summary_cap=summary_cap,
+    )
     _mode, out_dir = choose_output_location(parsers, file_mode='combined')
     out_path = out_dir / fname
     with open(out_path, 'w', encoding='utf-8') as f:
@@ -4153,7 +5998,7 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry],
                 p.trim_to_live_context()
             scope_label = "live context"
 
-    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap = \
+    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap, orch_filter = \
         interactive_filter(parsers, scope_label=scope_label)
 
     if not any(section_filter.values()):
@@ -4211,7 +6056,7 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry],
         try:
             combined_md, combined_fname = combine_parsers_to_markdown(
                 parsers, section_filter, clean_content, output_cap,
-                user_cap, agent_cap, reason_cap, summary_cap,
+                user_cap, agent_cap, reason_cap, summary_cap, orch_filter,
             )
             out_path = out_dir / combined_fname
             with open(out_path, 'w', encoding='utf-8') as f:
@@ -4235,6 +6080,7 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry],
                     agent_cap=agent_cap,
                     reasoning_cap=reason_cap,
                     summary_cap=summary_cap,
+                    orch_filter=orch_filter,
                 )
                 try:
                     date_prefix = datetime.fromtimestamp((parser.date_created or 0) / 1000.0).strftime("%Y%m%d")
@@ -4315,7 +6161,10 @@ def interactive_find_session_by_id():
         return scan_all_sessions() if WORKSPACE_SESSIONS_DIR.exists() else []
 
     def _scan_cli():
-        return scan_cli_sessions() if KIRO_CLI_SESSIONS_DIR.exists() else []
+        if not KIRO_CLI_SESSIONS_DIR.exists():
+            return []
+        # The session id is the filename, so a search parses only the matches.
+        return scan_cli_sessions(id_query=sid)
 
     with ThreadPoolExecutor(max_workers=2) as ex:
         ide_future = ex.submit(_scan_ide)

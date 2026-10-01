@@ -44,8 +44,10 @@ export with interactive controls.
 - **Session ID finder:** search both IDE and CLI stores in parallel by full
   session ID or prefix. If a match exists on both sides, the tool asks which one
   to export.
-- **Visible session IDs:** every session row shows its full ID, and the
-  workspace picker shows the latest session ID for each workspace.
+- **Visible session IDs:** each session row shows its session ID. The ID
+  shortens to a searchable prefix only when the terminal is too narrow for
+  the title. The directory picker shows the session count, age, short name,
+  and path.
 - **Workspace-aware browsing:** sessions are grouped by workspace/project
   directory. Running from inside a workspace auto-selects that workspace.
 - **CLI helper-session toggle:** Kiro CLI can create many subagent/helper
@@ -57,8 +59,13 @@ export with interactive controls.
   into one combined Markdown file.
 - **Chain merge export for IDE:** export detected compaction chains as one
   unified document with lineage annotations.
-- **Interactive section filter:** toggle 22 sections, apply presets, and cap
-  large outputs before writing.
+- **Interactive section filter:** toggle every section, apply presets, and cap
+  large outputs before writing. The footer shows lines and an approximate
+  token count for the current selection.
+- **Orchestration filter:** a Kiro CLI crew stays in the transcript where the
+  lead agent launched it. The default keeps each stage's last report. Status,
+  commands, command output, file activity, and reasoning are separate rows
+  with their own line and token counts.
 - **Live-context mode for IDE:** reproduce Kiro IDE's compaction behavior by
   keeping only the active context after summarization.
 - **Zero required dependencies:** uses Python standard library by default.
@@ -220,7 +227,8 @@ saves each session next to its own project.
 | Web Searches | Off | Web search queries and result links |
 | Web Fetches | Off | Retrieved URL content |
 | MCP Calls | Off | MCP tool calls and responses |
-| Sub-Agent Calls | On | Task/subagent invocations and results |
+| Sub-Agent Calls | On | Single sub-agent invocations and results |
+| Orchestrations | On | CLI crews, in place, with each stage's last report |
 | Compaction Summary | On | Context compaction summaries |
 | Intent Classification | Off | Intent classification records |
 | Errors | Off | Error records |
@@ -241,8 +249,21 @@ The filter screen lets you:
 - Keep only the last N user messages, agent messages, reasoning blocks, or
   summaries.
 - Enable clean-chat mode to strip IDE context noise from user prompts.
+- Under Orchestrations, choose completed, cancelled, error, or still-running
+  crews, and turn stage layers on or off. Each row shows how many lines and
+  approximately how many tokens that choice adds. For every output cap the
+  filter offers, a heavy layer's count matches the fenced text that will be
+  written. The default layers are the stage roster and the last report.
+  Commands, command output, file contents, and reasoning stay off until you
+  enable them.
+- The output cap also trims stage command output, file dumps, searches, and
+  reasoning when those layers are on. It does not trim the last-state reports.
 
-This is useful when a raw session is too large for a context window.
+This is useful when a raw session is too large for a context window. A crew
+with dozens of stages can hold tens of megabytes of command output. The filter
+shows that cost before anything is written. The default export keeps the
+report each stage actually returned, including a report recovered from a
+stage whose crew was cancelled or failed.
 
 ---
 
@@ -310,6 +331,16 @@ Expected matches should only be generic examples or platform storage references.
 ---
 
 ## Release Notes
+
+### [v1.3.0](https://github.com/MeXenon/kiro-session-export/releases/tag/v1.3.0)
+
+- CLI orchestrations export where the lead agent launched them, with each
+  stage's last report by default.
+- The section filter counts lines and tokens for orchestration status and
+  stage layers, in fixed columns, with orchestration choices marked as
+  sub-options.
+- IDE startup reads execution metadata from the ends of the record instead
+  of the whole transcript.
 
 ### [v1.2.1](https://github.com/MeXenon/kiro-session-export/releases/tag/v1.2.1)
 
