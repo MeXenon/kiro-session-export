@@ -163,7 +163,8 @@ the tool lists them and asks which one to use.
 2. **Browse workspaces:** workspaces are sorted by recent activity. The current
    workspace is highlighted when detected.
 3. **Select sessions:** type IDs like `1`, `1, 3`, or `a` for all listed.
-4. **Choose scope:** full session, last N turns, or live context when available.
+4. **Choose turns:** full session, the first or last N turns, a turn range, or
+   live context. Every choice shows its turn count, lines, and estimated tokens.
 5. **Filter sections:** use the fullscreen filter UI to choose what to export.
 6. **Choose destination:** file, clipboard, or both.
 7. **Choose save folder:** project directory or script directory when they differ.
@@ -331,6 +332,14 @@ Expected matches should only be generic examples or platform storage references.
 ---
 
 ## Release Notes
+
+### [v1.4.0](https://github.com/MeXenon/kiro-session-export/releases/tag/v1.4.0)
+
+- After a session loads, choose the full session, the first or last N turns,
+  a turn range, or the live context. Each choice shows turns, lines, and
+  estimated tokens.
+- A screenshot returned by a file read stays an image note, so the turn size
+  follows the conversation.
 
 ### [v1.3.0](https://github.com/MeXenon/kiro-session-export/releases/tag/v1.3.0)
 

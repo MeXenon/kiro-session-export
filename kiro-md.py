@@ -279,6 +279,23 @@ def short_workspace(p: Optional[str]) -> str:
         return p
     return parts[-1] or (parts[-2] if len(parts) > 1 else p)
 
+def _image_note(image) -> str:
+    """One line for an image payload. Never pretty-print the bytes."""
+    fmt = ''
+    data = None
+    if isinstance(image, dict):
+        fmt = str(image.get('format') or '')
+        source = image.get('source') if isinstance(image.get('source'), dict) else image
+        if isinstance(source, dict):
+            data = source.get('data')
+    label = fmt or 'image'
+    if isinstance(data, str):
+        return f'[Image {label}, {len(data):,} chars]'
+    if isinstance(data, (list, tuple, bytes, bytearray)):
+        return f'[Image {label}, {len(data):,} bytes]'
+    return f'[Image {label}]'
+
+
 def msg_text(content) -> str:
     """Extract plain text from Kiro's `message.content` (string or list of {type:text,text:...})."""
     if isinstance(content, str):
@@ -291,11 +308,16 @@ def msg_text(content) -> str:
                     t = sub.get('text', sub.get('data', ''))
                     if isinstance(t, str):
                         out.append(t)
+                elif sub.get('kind') in ('image', 'Image') or sub.get('type') in ('image', 'Image') or 'Image' in sub:
+                    payload = sub.get('Image') or sub.get('data') or sub
+                    out.append(_image_note(payload if isinstance(payload, dict) else {}))
                 else:
-                    # other types may appear; keep them with type marker
-                    t = sub.get('text', '') if isinstance(sub.get('text'), str) else json.dumps(sub, ensure_ascii=False)
-                    if t:
-                        out.append(t)
+                    # other types may appear; keep a short marker, not a dumped payload
+                    t = sub.get('text', '') if isinstance(sub.get('text'), str) else ''
+                    if not t:
+                        kind = sub.get('kind') or sub.get('type') or 'attachment'
+                        t = f'[{kind}]'
+                    out.append(t)
             elif isinstance(sub, str):
                 out.append(sub)
         return '\n'.join(out)
@@ -1766,54 +1788,22 @@ class SessionParser:
 
     # ------------------------------------------------------------
     def get_turn_boundaries(self) -> List[int]:
-        return [i for i, item in enumerate(self.data)
-                if item['type'] == 'user_message' and not item.get('hidden')]
+        return turn_boundaries(self.data)
 
     def get_turn_count(self) -> int:
         return len(self.get_turn_boundaries())
 
     def trim_to_last_n_turns(self, n: int):
-        """Keep only the last N user turns and everything that followed each.
-        If the session started from a compaction summary (intro), prepend that
-        summary block so the trimmed export retains its setup context."""
-        if n <= 0:
-            return
-        b = self.get_turn_boundaries()
-        if not b or n >= len(b):
-            return
-        cut = b[-n]
-        # Preserve the intro session_event + summarization (if present) so
-        # the reader understands the conversation's lineage.
-        intro_prefix: List[Dict] = []
-        for item in self.data[:cut]:
-            if item['type'] == 'session_event' and item.get('event') == 'continued_from_compaction':
-                intro_prefix.append(item)
-            elif item['type'] == 'summarization' and item.get('where') == 'intro':
-                intro_prefix.append(item)
-            else:
-                # Only the very first prefix matters; stop scanning past the
-                # first non-intro item.
-                if intro_prefix:
-                    break
-        self.data = intro_prefix + self.data[cut:]
+        """Keep the last N user turns and the agent work that followed each.
+
+        A session that continued from a compaction summary keeps that opening
+        summary, so the trimmed export still has its setup.
+        """
+        apply_extraction_scope(self, _last_scope(n) if n > 0 else _full_scope())
 
     def trim_to_live_context(self):
-        """Replicate Kiro's compaction logic:
-           every `summarization` block CLEARS prior items and keeps only itself
-           plus everything that came after it."""
-        live: List[Dict] = []
-        for item in self.data:
-            if item['type'] == 'session_event' and item.get('event') == 'context_compacted':
-                # Find the matching summarization right after — drop everything we accumulated.
-                live = [item]
-            elif item['type'] == 'summarization' and item.get('where') == 'inline':
-                live.append(item)
-            elif item['type'] == 'summarization' and item.get('where') == 'intro':
-                # intro summaries already live at session start — keep them
-                live.append(item)
-            else:
-                live.append(item)
-        self.data = live
+        """Keep the transcript from the latest compaction forward."""
+        apply_extraction_scope(self, _live_scope())
 
     # ------------------------------------------------------------
     def count_lines_by_section(self) -> Dict[str, int]:
@@ -2279,6 +2269,10 @@ class CliSessionParser:
                 parts.append(cls._json_text(item.get('Json')))
             elif 'Error' in item:
                 parts.append(cls._json_text(item.get('Error')))
+            elif 'Image' in item:
+                # A screenshot is a byte array. Dumping it becomes tens of
+                # megabytes of JSON and is not part of the conversation.
+                parts.append(_image_note(item.get('Image')))
             else:
                 parts.append(cls._json_text(item))
         return '\n'.join(p for p in parts if p)
@@ -4968,47 +4962,409 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
     return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap, orch_filter
 
 # ──────────────────────────────────────────────────────────────
-# Extraction scope
+# Turn scope
+#
+# A turn starts at a visible user message and runs through every agent step
+# that followed it, up to the next visible user message. The opening
+# compaction summary stays with a later slice so the export still has its setup.
 # ──────────────────────────────────────────────────────────────
-def select_extraction_scope(parsers: List[SessionParser]) -> Tuple[str, int]:
-    _clear_screen()
-    print(f"\n  {Style.BOLD}{Style.HEADER}EXTRACTION SCOPE{Style.RESET}\n")
-    print(f"  {Style.DIM}{'━' * 64}{Style.RESET}\n")
-    for i, p in enumerate(parsers):
-        tc = p.get_turn_count()
-        label = f"Session {i+1}" if len(parsers) > 1 else "Session"
-        title = p.title
-        if len(title) > 48:
-            title = title[:45] + '...'
-        badges = []
-        if p.started_from_compaction:
-            badges.append('↻ from compaction')
-        if p.compaction_count:
-            badges.append(f'✂ compacts ×{p.compaction_count}')
-        if p.continuation_count:
-            badges.append(f'↪ ×{p.continuation_count}')
-        bs = ' '.join(badges)
-        print(f"  {Style.CYAN}{label}{Style.RESET}  {Style.DIM}{title}{Style.RESET}")
-        ctx_str = ""
-        if p.context_usage_pct:
-            ctx_str = f"  {Style.DIM}context: {p.context_usage_pct:.1f}%{Style.RESET}"
-        bs_str = f"  {Style.YELLOW}{bs}{Style.RESET}" if bs else ""
-        print(f"           {Style.BOLD}{tc}{Style.RESET} turn{'s' if tc != 1 else ''}{ctx_str}{bs_str}\n")
-    print(f"  {Style.DIM}{'━' * 64}{Style.RESET}")
-    print(f"  {Style.DIM}A 'turn' = one user message + the agent work that followed.{Style.RESET}\n")
-    print(f"    {Style.GREEN}[F]{Style.RESET} Full Session — export every turn  {Style.DIM}(Default){Style.RESET}")
-    print(f"    {Style.YELLOW}[L]{Style.RESET} Last N Turns — only the most recent N turns")
-    print(f"    {Style.CYAN}[C]{Style.RESET} Live Context — replace pre-compaction history with the summary\n")
-    choice = input(f"  {Style.BOLD}Select > {Style.RESET}").strip().lower()
-    if choice == 'c':
-        return 'live', 0
-    if choice == 'l':
-        while True:
-            n = input(f"  {Style.BOLD}How many recent turns? > {Style.RESET}").strip()
-            if n.isdigit() and int(n) > 0:
-                return 'last_n', int(n)
-            print(f"  {Style.error('Enter a positive number.')}")
-    return 'full', 0
+_SCOPE_PRESETS = (1, 3, 5, 10, 20, 50)
+
+
+def _full_scope() -> Dict:
+    return {'mode': 'full', 'label': 'full session'}
+
+
+def _last_scope(n: int) -> Dict:
+    n = int(n)
+    word = 'turn' if n == 1 else 'turns'
+    return {'mode': 'last', 'n': n, 'label': f'last {n} {word}'}
+
+
+def _first_scope(n: int) -> Dict:
+    n = int(n)
+    word = 'turn' if n == 1 else 'turns'
+    return {'mode': 'first', 'n': n, 'label': f'first {n} {word}'}
+
+
+def _range_scope(start: int, end: int) -> Dict:
+    return {'mode': 'range', 'start': int(start), 'end': int(end),
+            'label': f'turns {int(start)}-{int(end)}'}
+
+
+def _live_scope() -> Dict:
+    return {'mode': 'live', 'label': 'live context'}
+
+
+def _is_intro_item(item: Dict) -> bool:
+    if item.get('type') == 'session_event' and item.get('event') == 'continued_from_compaction':
+        return True
+    return item.get('type') == 'summarization' and item.get('where') == 'intro'
+
+
+def _intro_prefix(data: List[Dict], cut: int) -> List[Dict]:
+    intro: List[Dict] = []
+    for item in data[:cut]:
+        if _is_intro_item(item):
+            intro.append(item)
+        elif intro:
+            break
+    return intro
+
+
+def turn_boundaries(data: List[Dict]) -> List[int]:
+    """Indexes of visible user messages. A hidden message stays inside its turn."""
+    return [i for i, item in enumerate(data)
+            if item.get('type') == 'user_message' and not item.get('hidden')]
+
+
+def slice_turns(data: List[Dict], start_turn: int, end_turn: int) -> List[Dict]:
+    """Keep turns start_turn..end_turn, 1-based and inclusive.
+
+    Turn 1 keeps everything before it. A later start keeps the compaction
+    intro, then those turns and the work that followed each of them.
+    """
+    bounds = turn_boundaries(data)
+    count = len(bounds)
+    if count == 0:
+        return list(data)
+    start_turn = max(1, int(start_turn))
+    end_turn = min(count, int(end_turn))
+    if start_turn > count or start_turn > end_turn:
+        return []
+    cut = bounds[start_turn - 1]
+    stop = bounds[end_turn] if end_turn < count else len(data)
+    if start_turn <= 1:
+        return list(data[:stop])
+    return _intro_prefix(data, cut) + data[cut:stop]
+
+
+def live_context_items(data: List[Dict]) -> List[Dict]:
+    """Transcript from the latest compaction event forward."""
+    live: List[Dict] = []
+    for item in data:
+        if item.get('type') == 'session_event' and item.get('event') == 'context_compacted':
+            live = [item]
+        else:
+            live.append(item)
+    return live
+
+
+def apply_extraction_scope(parser, scope: Dict) -> None:
+    """Replace parser.data with the chosen turns. Full scope leaves it alone."""
+    mode = (scope or {}).get('mode') or 'full'
+    if mode == 'full':
+        return
+    count = len(turn_boundaries(parser.data))
+    if mode == 'live':
+        parser.data = live_context_items(parser.data)
+    elif mode == 'last':
+        n = int(scope.get('n') or 0)
+        if count and 0 < n < count:
+            parser.data = slice_turns(parser.data, count - n + 1, count)
+    elif mode == 'first':
+        n = int(scope.get('n') or 0)
+        if count and 0 < n < count:
+            parser.data = slice_turns(parser.data, 1, n)
+    elif mode == 'range':
+        if not count:
+            parser.data = []
+        else:
+            start = int(scope.get('start') or 1)
+            end = int(scope.get('end') or count)
+            if start > count or start > end:
+                parser.data = []
+            else:
+                parser.data = slice_turns(parser.data, start, min(end, count))
+    parser.user_turn_count = len(turn_boundaries(parser.data))
+
+
+def _item_scope_size(item: Dict) -> Tuple[int, int]:
+    """Lines and characters one item contributes before the section filter."""
+    if item.get('type') == 'orchestration':
+        return orchestration_metrics(item, default_orch_filter(), 0)
+    return estimate_lines(item), _item_export_chars(item, 0)
+
+
+class TurnIndex:
+    """Per-item sizes for one loaded session, so every scope can be priced."""
+
+    def __init__(self, parser):
+        self.data = parser.data
+        self.bounds = turn_boundaries(parser.data)
+        # Same header allowance the section filter uses for session metadata.
+        has_meta = bool(getattr(parser, 'metadata', None))
+        self.meta_lines = 7 if has_meta else 0
+        self.meta_chars = 180 if has_meta else 0
+        self.lines: List[int] = []
+        self.chars: List[int] = []
+        for item in self.data:
+            ln, ch = _item_scope_size(item)
+            self.lines.append(ln)
+            self.chars.append(ch)
+        self.pl = [0]
+        self.pc = [0]
+        for ln, ch in zip(self.lines, self.chars):
+            self.pl.append(self.pl[-1] + ln)
+            self.pc.append(self.pc[-1] + ch)
+        self._live: Optional[Tuple[int, int, int]] = None
+
+    def _sum(self, start: int, stop: int) -> Tuple[int, int]:
+        return self.pl[stop] - self.pl[start], self.pc[stop] - self.pc[start]
+
+    def measure(self, scope: Dict) -> Tuple[int, int, int]:
+        """Return (turns, lines, chars) this session contributes."""
+        mode = (scope or {}).get('mode') or 'full'
+        count = len(self.bounds)
+        if mode == 'live':
+            if self._live is None:
+                items = live_context_items(self.data)
+                positions = {id(item): i for i, item in enumerate(self.data)}
+                ln = ch = 0
+                for item in items:
+                    i = positions.get(id(item))
+                    if i is None:
+                        continue
+                    ln += self.lines[i]
+                    ch += self.chars[i]
+                turns = sum(
+                    1 for item in items
+                    if item.get('type') == 'user_message' and not item.get('hidden')
+                )
+                self._live = (turns, ln + self.meta_lines, ch + self.meta_chars)
+            return self._live
+        if mode == 'full' or count == 0:
+            ln, ch = self._sum(0, len(self.data))
+            return count, ln + self.meta_lines, ch + self.meta_chars
+        if mode == 'last':
+            n = int(scope.get('n') or 0)
+            if n <= 0:
+                return 0, self.meta_lines, self.meta_chars
+            if n >= count:
+                ln, ch = self._sum(0, len(self.data))
+                return count, ln + self.meta_lines, ch + self.meta_chars
+            start, end = count - n + 1, count
+        elif mode == 'first':
+            n = int(scope.get('n') or 0)
+            if n <= 0:
+                return 0, self.meta_lines, self.meta_chars
+            if n >= count:
+                ln, ch = self._sum(0, len(self.data))
+                return count, ln + self.meta_lines, ch + self.meta_chars
+            start, end = 1, n
+        elif mode == 'range':
+            start = int(scope.get('start') or 1)
+            end = int(scope.get('end') or count)
+            if start > end or start > count:
+                return 0, self.meta_lines, self.meta_chars
+            start = max(1, start)
+            end = min(end, count)
+        else:
+            ln, ch = self._sum(0, len(self.data))
+            return count, ln + self.meta_lines, ch + self.meta_chars
+        cut = self.bounds[start - 1]
+        stop = self.bounds[end] if end < count else len(self.data)
+        if start <= 1:
+            ln, ch = self._sum(0, stop)
+        else:
+            intro: List[int] = []
+            for i, item in enumerate(self.data[:cut]):
+                if _is_intro_item(item):
+                    intro.append(i)
+                elif intro:
+                    break
+            ln = sum(self.lines[i] for i in intro)
+            ch = sum(self.chars[i] for i in intro)
+            body_ln, body_ch = self._sum(cut, stop)
+            ln += body_ln
+            ch += body_ch
+        return end - start + 1, ln + self.meta_lines, ch + self.meta_chars
+
+
+def measure_scope(indexes: List[TurnIndex], scope: Dict) -> Tuple[int, int, int]:
+    """Sum (turns, lines, tokens) across every selected session."""
+    turns = lines = chars = 0
+    for index in indexes:
+        t, ln, ch = index.measure(scope)
+        turns += t
+        lines += ln
+        chars += ch
+    return turns, lines, estimate_tokens(chars)
+
+
+def scope_quick_choices(max_turns: int) -> List[Dict]:
+    """Preset slices that are smaller than the longest selected session."""
+    if max_turns <= 1:
+        return []
+    choices: List[Dict] = []
+    for kind in ('last', 'first'):
+        for n in _SCOPE_PRESETS:
+            if n < max_turns:
+                choices.append(_last_scope(n) if kind == 'last' else _first_scope(n))
+    return choices
+
+
+def _clip_title(title: str, width: int = 52) -> str:
+    title = title or 'Untitled session'
+    if len(title) <= width:
+        return title
+    return title[:width - 3] + '...'
+
+
+def _scope_row(key: str, label: str, turns, lines, tokens, note: str, label_w: int) -> str:
+    turn_cell = f'{int(turns):>6}' if isinstance(turns, int) else f'{"—":>6}'
+    line_cell = f'{int(lines):>10,}' if isinstance(lines, int) else f'{"—":>10}'
+    token_cell = _token_body(tokens) if isinstance(tokens, int) else f'{"—":>11}'
+    note_s = f'  {Style.DIM}{note}{Style.RESET}' if note else ''
+    return (f"  {Style.YELLOW}{key:<4}{Style.RESET}{label:<{label_w}}"
+            f"{turn_cell}{line_cell}  {token_cell}{note_s}")
+
+
+def select_extraction_scope(parsers: List[SessionParser]) -> Dict:
+    """Ask which turns to export. Every row shows lines and estimated tokens."""
+    indexes = [TurnIndex(p) for p in parsers]
+    max_turns = max((len(index.bounds) for index in indexes), default=0)
+    keeps_intro = any(getattr(p, 'started_from_compaction', False) for p in parsers)
+    shown = parsers if len(parsers) <= 6 else parsers[:5]
+
+    def _paint_menu():
+        _clear_screen()
+        print(f"\n  {Style.BOLD}{Style.HEADER}WHICH TURNS{Style.RESET}\n")
+        for i, (parser, index) in enumerate(zip(shown, indexes[:len(shown)]), start=1):
+            turns, lines, tokens = index.measure(_full_scope())
+            label = f"Session {i}" if len(parsers) > 1 else "Session"
+            badges = []
+            if parser.started_from_compaction:
+                badges.append('↻ from compaction')
+            if parser.compaction_count:
+                badges.append(f'✂ compacts ×{parser.compaction_count}')
+            if parser.continuation_count:
+                badges.append(f'↪ ×{parser.continuation_count}')
+            badge = f"  {Style.YELLOW}{'  '.join(badges)}{Style.RESET}" if badges else ''
+            ctx = ''
+            if parser.context_usage_pct:
+                ctx = f"  {Style.DIM}context {parser.context_usage_pct:.1f}%{Style.RESET}"
+            print(f"  {Style.CYAN}{label}{Style.RESET}  {Style.DIM}{_clip_title(parser.title)}{Style.RESET}{badge}")
+            print(f"           {Style.BOLD}{turns}{Style.RESET} "
+                  f"turn{'s' if turns != 1 else ''}    "
+                  f"{lines:,} lines    {_token_body(tokens)}{ctx}")
+        if len(parsers) > len(shown):
+            rest = parsers[len(shown):]
+            extra_turns = sum(p.get_turn_count() for p in rest)
+            print(f"  {Style.DIM}… and {len(rest)} more session(s), {extra_turns} turns{Style.RESET}")
+        if len(parsers) > 1:
+            total_turns, total_lines, total_tokens = measure_scope(indexes, _full_scope())
+            print(f"\n  {Style.BOLD}{len(parsers)} sessions together{Style.RESET}  "
+                  f"{total_turns} turns    {total_lines:,} lines    {_token_body(total_tokens)}")
+            print(f"  {Style.DIM}A choice applies to each session. The figures are the sum.{Style.RESET}")
+        print(f"\n  {Style.DIM}A turn is one user message and every step the agent took after it,{Style.RESET}")
+        print(f"  {Style.DIM}up to the next user message. Sizes count everything in those turns.{Style.RESET}")
+        print(f"  {Style.DIM}The next screen chooses which sections to keep.{Style.RESET}\n")
+
+        rows: List[Tuple[str, Optional[Dict], str]] = [('F', _full_scope(), 'default')]
+        for number, scope in enumerate(scope_quick_choices(max_turns), start=1):
+            note = 'keeps the opening summary' if keeps_intro and scope['mode'] == 'last' else ''
+            rows.append((str(number), scope, note))
+        rows.append(('L', None, 'you type the count'))
+        rows.append(('I', None, 'you type the count'))
+        rows.append(('R', None, 'you type the start and end'))
+        live = _live_scope()
+        live_turns, live_lines, live_tokens = measure_scope(indexes, live)
+        full_turns, full_lines, full_tokens = measure_scope(indexes, _full_scope())
+        live_note = 'same as the full session' if (live_lines, live_tokens) == (full_lines, full_tokens) else 'after the latest compaction'
+        rows.append(('C', live, live_note))
+
+        labels = {
+            'F': 'Full session',
+            'L': 'Last N turns',
+            'I': 'First N turns',
+            'R': 'Turn range',
+            'C': 'Live context',
+        }
+        label_w = 28
+        print(f"  {Style.DIM}{'':4}{'SCOPE':<{label_w}}{'TURNS':>6}{'LINES':>10}  ~ TOKENS{Style.RESET}")
+        keyed: Dict[str, Optional[Dict]] = {}
+        for key, scope, note in rows:
+            keyed[key.lower()] = scope
+            if scope is None:
+                name = labels[key]
+                print(_scope_row(key, name, None, None, None, note, label_w))
+                continue
+            if key in labels:
+                name = labels[key]
+            else:
+                name = scope['label'][:1].upper() + scope['label'][1:]
+            turns, lines, tokens = measure_scope(indexes, scope)
+            print(_scope_row(key, name, turns, lines, tokens, note, label_w))
+        print()
+        return keyed
+
+    while True:
+        keyed = _paint_menu()
+        choice = input(f"  {Style.BOLD}Select > {Style.RESET}").strip().lower()
+        if choice in ('', 'f', 'full'):
+            return _full_scope()
+        if choice in keyed and keyed[choice] is not None:
+            return keyed[choice]
+        if choice in ('l', 'last', 'i', 'first'):
+            if max_turns <= 0:
+                print(f"  {Style.warn('This session has no user turns to split.')}")
+                input(f"  {Style.DIM}Press Enter to continue...{Style.RESET}")
+                continue
+            kind = 'last' if choice in ('l', 'last') else 'first'
+            word = 'latest' if kind == 'last' else 'earliest'
+            n = _ask_positive(f"  {Style.BOLD}How many {word} turns? > {Style.RESET}")
+            if n is None:
+                continue
+            scope = _last_scope(n) if kind == 'last' else _first_scope(n)
+            if n >= max_turns:
+                print(f"  {Style.DIM}That covers every turn.{Style.RESET}")
+                scope = _full_scope()
+            if _confirm_scope(indexes, scope):
+                return scope
+            continue
+        if choice in ('r', 'range'):
+            if max_turns <= 0:
+                print(f"  {Style.warn('This session has no user turns to split.')}")
+                input(f"  {Style.DIM}Press Enter to continue...{Style.RESET}")
+                continue
+            start = _ask_positive(f"  {Style.BOLD}From turn (1-{max_turns}) > {Style.RESET}")
+            if start is None:
+                continue
+            end = _ask_positive(f"  {Style.BOLD}Through turn (1-{max_turns}) > {Style.RESET}")
+            if end is None:
+                continue
+            if end < start:
+                print(f"  {Style.error('The end turn comes before the start turn.')}")
+                input(f"  {Style.DIM}Press Enter to continue...{Style.RESET}")
+                continue
+            scope = _range_scope(start, end)
+            if start <= 1 and end >= max_turns:
+                scope = _full_scope()
+            if _confirm_scope(indexes, scope):
+                return scope
+            continue
+        print(f"  {Style.error('Choose a key from the list, or press Enter for the full session.')}")
+        input(f"  {Style.DIM}Press Enter to continue...{Style.RESET}")
+
+
+def _ask_positive(prompt: str) -> Optional[int]:
+    while True:
+        raw = input(prompt).strip()
+        if raw == '':
+            return None
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+        print(f"  {Style.error('Enter a positive number, or press Enter to go back.')}")
+
+
+def _confirm_scope(indexes: List[TurnIndex], scope: Dict) -> bool:
+    turns, lines, tokens = measure_scope(indexes, scope)
+    print(f"\n  {Style.BOLD}{scope['label']}{Style.RESET}    "
+          f"{turns} turn{'s' if turns != 1 else ''}    "
+          f"{lines:,} lines    {_token_body(tokens)}")
+    answer = input(f"  {Style.BOLD}Use this? {Style.RESET}{Style.DIM}[Y/n]{Style.RESET} ").strip().lower()
+    return answer in ('', 'y', 'yes')
 
 # ──────────────────────────────────────────────────────────────
 # Session listing UI
@@ -5985,18 +6341,13 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry],
     if not parsers:
         return
 
-    scope_type, turn_limit = ('full', 0)
     scope_label = ""
     if allow_scope:
-        scope_type, turn_limit = select_extraction_scope(parsers)
-        if scope_type == 'last_n':
+        scope = select_extraction_scope(parsers)
+        if scope.get('mode') != 'full':
             for p in parsers:
-                p.trim_to_last_n_turns(turn_limit)
-            scope_label = f"last {turn_limit} turn{'s' if turn_limit != 1 else ''}"
-        elif scope_type == 'live':
-            for p in parsers:
-                p.trim_to_live_context()
-            scope_label = "live context"
+                apply_extraction_scope(p, scope)
+        scope_label = scope.get('label') or ''
 
     section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap, orch_filter = \
         interactive_filter(parsers, scope_label=scope_label)
@@ -6225,7 +6576,6 @@ def interactive_find_session_by_id():
             "1", [entry],
             parser_cls=CliSessionParser,
             build_execution_index=False,
-            allow_scope=False,
         )
     else:
         EXEC_INDEX = ExecutionIndex(KIRO_HOME)
@@ -6514,14 +6864,12 @@ def interactive_loop_cli():
                     idx, rendered_sessions,
                     parser_cls=CliSessionParser,
                     build_execution_index=False,
-                    allow_scope=False,
                 )
         elif choice:
             process_conversion(
                 choice, rendered_sessions,
                 parser_cls=CliSessionParser,
                 build_execution_index=False,
-                allow_scope=False,
             )
 
 

@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## v1.4.0 - 2026-10-01
+
+### Added
+
+- After a session loads, the export asks which turns to keep: the full
+  session, the first or last N turns, a turn range, or the live context after
+  the latest compaction. Each choice shows how many turns, lines, and
+  estimated tokens it keeps. IDE and CLI sessions both get this choice.
+
+### Fixed
+
+- A file read that returned a screenshot is recorded as an image note. The
+  byte array is not copied into the transcript, so turn sizes stay on the
+  conversation instead of the image payload.
+
 ## v1.3.0 - 2026-10-01
 
 ### Added
