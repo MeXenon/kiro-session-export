@@ -1,0 +1,33 @@
+name: Publish GitHub release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify tag matches script version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          grep -F "Converter  (v${version})" kiro-md.py
+          python -m py_compile kiro-md.py
+          python -m unittest discover -q
+      - name: Publish tested Kiro v2/v3 session export
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Kiro Session Export ${{ github.ref_name }}
+          generate_release_notes: true
+          make_latest: true
+          files: kiro-md.py
