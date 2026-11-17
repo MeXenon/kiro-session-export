@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## v1.5.0 - 2026-11-17
+
+### Added
+
+- Native Kiro CLI V3 session discovery and Markdown export from per-workspace
+  `sess_<uuid>/session.json` and `messages.jsonl` storage.
+- Support V3 metadata/model, typed user/assistant messages, tool use/results,
+  session events, bare/qualified session-ID search, and mixed V2/V3 lists.
+- A safe ZIP archive source for V3 `/chat save` archives; extracted only into
+  disposable storage with bounded sizes and no path traversal.
+- Eleven synthetic regression/integration tests and cross-platform GitHub CI.
+
+### Compatibility
+
+- V2 CLI metadata/events and Kiro IDE execution-record exports remain intact.
+- Tested read-only on installed Kiro CLI 3.3.0 and all discovered local V3
+  session records; no user conversation content was committed.
+
+
 ## v1.4.0 - 2026-10-01
 
 ### Added
