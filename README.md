@@ -36,7 +36,8 @@ export with interactive controls.
 ## Highlights
 
 - **Kiro IDE plus CLI v2 and v3:** browse both legacy and current CLI sessions from the same menu.
-- **Kiro v3 archive conversion:** read a `/chat save backup.zip` archive directly into Markdown using safe temporary staging; no import into Kiro or writes to its session store.
+- **Kiro v3 complete event details:** retain session settings (model, effort, agent mode and metadata), message fields, tool arguments/results, usage and future event payloads.
+- **Missing-history detection:** a V3 metadata-only shell is shown with a clear warning, and cannot be exported as a fabricated short conversation.
 - **Full Kiro CLI JSONL parsing:** exports real prompts, assistant messages,
   reasoning, file reads, file creates, file edits, terminal commands, terminal
   outputs, grep/glob/code searches, MCP calls, sub-agent/task calls, web search,
@@ -136,7 +137,6 @@ At launch, choose the data source:
 [1] Kiro IDE sessions
 [2] Kiro CLI sessions
 [3] Find by session ID
-[4] Convert Kiro v3 ZIP archive
 ```
 
 ### Kiro IDE Sessions
@@ -153,9 +153,9 @@ Scans **both** legacy CLI v2 `~/.kiro/sessions/cli/*.json` and Kiro v3
 new session IDs, prompts, assistant messages, tool calls/results, model,
 workspace, and session events; v2 behavior remains unchanged.
 
-The startup `[4]` option accepts V3 `/chat save backup.zip` archives with a
-matching session metadata/transcript pair. ZIP contents are read to a disposable
-temporary directory with size limits and without extracting untrusted paths.
+Native V3 is read from its original local session directory in read-only mode.
+When `messages.jsonl` is missing or has no saved chat, the tool reports this
+explicitly instead of exporting the session title as a made-up conversation.
 
 ### Find By Session ID
 
@@ -167,7 +167,7 @@ the tool lists them and asks which one to use.
 
 ## Interface Flow
 
-1. **Choose source:** IDE, CLI (v2/v3), Find by session ID, or a V3 ZIP archive.
+1. **Choose source:** IDE, CLI (v2/v3), or Find by session ID.
 2. **Browse workspaces:** workspaces are sorted by recent activity. The current
    workspace is highlighted when detected.
 3. **Select sessions:** type IDs like `1`, `1, 3`, or `a` for all listed.
@@ -338,8 +338,10 @@ sessions. Set `KIRO_V3_SESSIONS_DIR` to use a non-default V3 sessions root:
 KIRO_V3_SESSIONS_DIR=/custom/kiro/sessions python kiro-md.py
 ```
 
-Kiro CLI V3 `/chat save backup.zip` archives can also be opened from option
-`[4]`; no running CLI session or authentication is required for a local ZIP.
+The V3 `session.json` is *metadata*, not conversation history. Real chat turns
+come from `messages.jsonl`. If the transcript is missing or malformed, the
+export refuses partial or synthetic output. This exporter cannot repair a
+source session that Kiro itself resumes with zero saved messages.
 
 Run synthetic V2/V3 tests with `python -m unittest discover -v`.
 They never open your real session directory.
@@ -373,8 +375,10 @@ Expected matches should only be generic examples or platform storage references.
 
 - Discover, search and export native CLI V3 sessions while preserving V2 and IDE support.
 - Support real V3 metadata, new session IDs, message events, tool calls/results and model details.
-- Read V3 ZIP archives in bounded, read-only temporary storage.
-- Add synthetic end-to-end tests for V2/V3 and ZIP archives.
+- Verify all persisted V3 session parameters and typed event fields without
+  fabricating chat messages or dropping tool responses.
+- Detect missing/empty/malformed V3 transcripts explicitly.
+- Add real-session and synthetic V2/V3 compatibility and error-path tests.
 
 ### [v1.4.0](https://github.com/MeXenon/kiro-session-export/releases/tag/v1.4.0)
 

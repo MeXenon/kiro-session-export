@@ -10,15 +10,18 @@ All notable changes to this project are documented here.
   `sess_<uuid>/session.json` and `messages.jsonl` storage.
 - Support V3 metadata/model, typed user/assistant messages, tool use/results,
   session events, bare/qualified session-ID search, and mixed V2/V3 lists.
-- A safe ZIP archive source for V3 `/chat save` archives; extracted only into
-  disposable storage with bounded sizes and no path traversal.
-- Eleven synthetic regression/integration tests and cross-platform GitHub CI.
+- Full V3 event and persisted session parameter fidelity: model, effort,
+  workspace, tools and results, usage, attachment metadata and future fields.
+- Explicitly reject missing, empty or corrupt V3 message streams instead of
+  inventing a user message from the session title.
+- Synthetic V2/V3 regression/integration tests and cross-platform GitHub CI.
 
 ### Compatibility
 
 - V2 CLI metadata/events and Kiro IDE execution-record exports remain intact.
-- Tested read-only on installed Kiro CLI 3.3.0 and all discovered local V3
-  session records; no user conversation content was committed.
+- Tested read-only on installed Kiro CLI 3.3.0; separate actual saved
+  conversations from metadata-only session shells instead of claiming they
+  contained complete chat history. No conversation content is committed.
 
 
 ## v1.4.0 - 2026-10-01
