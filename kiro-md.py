@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kiro Session Manager & Markdown Converter  (v1.0)
+Kiro Session Manager & Markdown Converter  (v1.5.0)
 -------------------------------------------------
 An interactive tool to browse, filter, and convert Kiro IDE chat
 sessions into readable Markdown documents.
@@ -32,6 +32,8 @@ import glob
 import re
 import base64
 import hashlib
+import tempfile
+import zipfile
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -118,6 +120,9 @@ def default_kiro_cli_sessions_dir() -> Path:
 KIRO_HOME = default_kiro_home()
 WORKSPACE_SESSIONS_DIR = KIRO_HOME / "workspace-sessions"
 KIRO_CLI_SESSIONS_DIR = default_kiro_cli_sessions_dir()
+# Kiro CLI v3 stores each conversation under its own workspace/session directory.
+KIRO_V3_SESSIONS_DIR = Path(os.environ.get(
+    'KIRO_V3_SESSIONS_DIR', str(Path.home() / '.kiro' / 'sessions')))
 
 # ──────────────────────────────────────────────────────────────
 # JSON fast path — use orjson if installed (3-5× faster than stdlib).
@@ -1138,10 +1143,10 @@ def _cli_json_paths(id_query: str = '') -> List[Path]:
 
 
 def scan_cli_sessions(id_query: str = '') -> List[CliSessionEntry]:
-    """Read Kiro CLI session indexes and return browser-ready entries."""
+    """Read Kiro CLI v2 and v3 indexes and return browser-ready entries."""
     paths = _cli_json_paths(id_query)
     if not paths:
-        return []
+        return scan_v3_sessions(id_query)
     from concurrent.futures import ThreadPoolExecutor
     workers = min(32, max(1, len(paths)))
     sessions: List[CliSessionEntry] = []
@@ -1149,8 +1154,139 @@ def scan_cli_sessions(id_query: str = '') -> List[CliSessionEntry]:
         for entry in pool.map(_parse_cli_session_file, paths, chunksize=32):
             if entry is not None:
                 sessions.append(entry)
+    sessions.extend(scan_v3_sessions(id_query))
     sessions.sort(key=lambda s: s.date_created, reverse=True)
     return sessions
+
+# ──────────────────────────────────────────────────────────────
+# Kiro CLI v3 session store (read-only). V2 CLI JSON remains supported.
+# ──────────────────────────────────────────────────────────────
+class V3SessionEntry(CliSessionEntry):
+    """A Kiro 3.x session with session.json and messages.jsonl."""
+    __slots__ = ()
+
+    def load_preview(self, head_bytes: int = 512 * 1024):
+        if self._preview_loaded:
+            return
+        self._preview_loaded = True
+        self._preview_first_user = normalize_title_candidate(self.title or '')
+        stream = self.session_file.with_name('messages.jsonl')
+        if not stream.is_file():
+            return
+        try:
+            seen = 0
+            with stream.open('r', encoding='utf-8', errors='replace') as fp:
+                for line in fp:
+                    seen += len(line)
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    payload = event.get('payload') or {}
+                    if isinstance(payload, dict) and payload.get('type') == 'user':
+                        content = payload.get('content')
+                        if isinstance(content, str) and content.strip():
+                            self._preview_first_user = normalize_title_candidate(content)
+                            return
+                    if seen > head_bytes:  # never scan full transcripts for a title
+                        break
+        except (ValueError, OSError):
+            return
+
+    @property
+    def is_empty_helper(self) -> bool:
+        return self.message_count == 0 and self.turn_count == 0
+
+    @property
+    def size(self) -> int:
+        total = super().size
+        try:
+            total += self.session_file.with_name('messages.jsonl').stat().st_size
+        except OSError:
+            pass
+        return total
+
+
+def _v3_session_from_folder(folder: Path) -> Optional[V3SessionEntry]:
+    """Parse the canonical V3 folder only; never interpret V2 CLI files as V3."""
+    if not (folder.name.startswith('sess_') or
+            re.fullmatch(r'[0-9a-fA-F-]{36}', folder.name)):
+        return None
+    shell = folder / 'session.json'
+    if not shell.is_file():
+        return None
+    try:
+        meta = _json_load_path(shell)
+        if not isinstance(meta, dict) or not str(meta.get('schemaVersion', '')).startswith('1.'):
+            return None
+        if meta.get('id') != folder.name:
+            return None
+        workspace_paths = meta.get('workspacePaths')
+        cwd = next((p for p in workspace_paths if isinstance(p, str)),
+                   '') if isinstance(workspace_paths, list) else ''
+        created_at = meta.get('createdAt') or ''
+        updated_at = meta.get('lastModifiedAt') or created_at
+        created_ms = parse_iso_datetime_ms(created_at)
+        updated_ms = parse_iso_datetime_ms(updated_at)
+        stream = folder / 'messages.jsonl'
+        message_count = turn_count = 0
+        if stream.is_file():
+            with stream.open('r', encoding='utf-8', errors='replace') as fp:
+                for line in fp:
+                    try:
+                        payload = json.loads(line).get('payload') or {}
+                    except ValueError:
+                        continue
+                    kind = payload.get('type')
+                    if kind in ('user', 'assistant'):
+                        message_count += 1
+                    if kind == 'user':
+                        turn_count += 1
+        entry = V3SessionEntry(
+            sid=folder.name, title=meta.get('title') or '',
+            created_ms=created_ms, updated_ms=updated_ms,
+            created_at=created_at, updated_at=updated_at,
+            cwd=cwd, session_file=shell, message_count=message_count,
+            turn_count=turn_count, reason='v3')
+        return entry
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def scan_v3_sessions(id_query: str = '') -> List[V3SessionEntry]:
+    """Discover Kiro CLI 3.x sessions without changing or migrating their store."""
+    root = KIRO_V3_SESSIONS_DIR
+    if not root.is_dir():
+        return []
+    query = (id_query or '').strip().lower()
+    paths = []
+    try:
+        for workspace in root.iterdir():
+            if not workspace.is_dir() or workspace.name == 'cli':
+                continue
+            # Both direct ~/.kiro/sessions/sess_*/ and hashed-workspace layouts exist.
+            candidates = [workspace] if workspace.name.startswith('sess_') else workspace.iterdir()
+            for folder in candidates:
+                if not folder.is_dir() or not folder.name.startswith('sess_'):
+                    continue
+                canonical = folder.name.lower()
+                bare = canonical[5:]
+                if query and not (
+                    canonical == query or bare == query or
+                    (len(query) >= 8 and
+                     (canonical.startswith(query) or bare.startswith(query)))):
+                    continue
+                paths.append(folder)
+    except OSError:
+        return []
+    if not paths:
+        return []
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(16, len(paths))) as pool:
+        result = list(pool.map(_v3_session_from_folder, paths))
+    return sorted((entry for entry in result if entry is not None),
+                  key=lambda entry: entry.date_created, reverse=True)
+
 
 # ──────────────────────────────────────────────────────────────
 # Session parser — joins shell-history with execution records
@@ -2387,6 +2523,8 @@ class CliSessionParser:
         }, execution_id)
 
     def _load(self):
+        if isinstance(self.entry, V3SessionEntry):
+            return self._load_v3()
         data = _json_load_path(self.entry.session_file)
         self.metadata = {
             'source': 'Kiro CLI',
@@ -2491,6 +2629,167 @@ class CliSessionParser:
                         'content': f"CLI content block: {kind}",
                         'execution_id': f"cli-turn-{i}",
                     })
+
+    def _load_v3(self):
+        """Convert Kiro CLI v3 typed message events without changing source data."""
+        session = _json_load_path(self.entry.session_file)
+        self.session_type = 'Kiro CLI v3'
+        self.autonomy_mode = str(session.get('agentMode') or '')
+        model = session.get('modelId')
+        if isinstance(model, str) and model:
+            self.model_titles.add(model)
+        self.metadata = {
+            'source': 'Kiro CLI v3', 'session_id': self.session_id,
+            'cwd': self.workspace_dir, 'created_at': self.entry.created_at,
+            'updated_at': self.entry.updated_at, 'schema_version': session.get('schemaVersion'),
+            'data_model_version': session.get('dataModelVersion'),
+        }
+        stream = self.entry.session_file.with_name('messages.jsonl')
+        if not stream.exists():
+            return
+        pending: Dict[str, Dict] = {}
+        user_count = assistant_count = 0
+        with stream.open('r', encoding='utf-8', errors='replace') as fp:
+            for line_num, line in enumerate(fp, start=1):
+                try:
+                    event = _orjson.loads(line) if _orjson is not None else json.loads(line)
+                except ValueError:
+                    # Preserve full historical data, but skip malformed individual entries.
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                payload = event.get('payload')
+                if not isinstance(payload, dict):
+                    continue
+                kind = payload.get('type')
+                event_id = event.get('id') or f'v3-event-{line_num}'
+                content = payload.get('content')
+                if kind == 'user':
+                    user_count += 1
+                    if isinstance(content, str) and content.strip():
+                        self._append_item({
+                            'type': 'user_message', 'content': content,
+                            'hidden': False, 'execution_id': event_id})
+                elif kind == 'assistant':
+                    assistant_count += 1
+                    if isinstance(content, str) and content.strip():
+                        self._append_item({
+                            'type': 'agent_message', 'content': content,
+                            'execution_id': payload.get('executionId') or event_id})
+                elif kind == 'tool_call':
+                    name = str(payload.get('toolName') or 'unknown_tool')
+                    args = payload.get('args')
+                    if not isinstance(args, dict):
+                        args = {'raw': args}
+                    call_id = str(payload.get('toolCallId') or event_id)
+                    path = args.get('path') or args.get('file_path') or '?'
+                    common = {'execution_id': call_id, 'state': 'Requested'}
+                    lowered = name.lower()
+                    if lowered in ('execute_pwsh', 'execute_bash', 'execute_shell',
+                                   'execute_command', 'run_command', 'shell'):
+                        item = {'type': 'terminal_cmd', 'tool': name,
+                                'command': str(args.get('command') or ''),
+                                'cwd': str(args.get('cwd') or self.workspace_dir)}
+                    elif lowered in ('fs_write', 'file_write', 'create_file'):
+                        item = {'type': 'file_create', 'path': path,
+                                'modified_content': args.get('text') or args.get('content') or ''}
+                    elif lowered in ('fs_append', 'str_replace', 'file_edit',
+                                     'fs_edit', 'edit_file'):
+                        item = {'type': 'file_edit', 'path': path, 'tool': name,
+                                'original_content': args.get('oldStr') or '',
+                                'modified_content': args.get('newStr') or args.get('text') or ''}
+                    elif lowered in ('fs_read', 'read_file', 'list_directory'):
+                        item = {'type': 'file_read', 'tool': name, 'files': [{'path': path}]}
+                    elif lowered in ('remote_web_search', 'web_search'):
+                        item = {'type': 'web_search', 'query': args.get('query') or '',
+                                'results': []}
+                    elif lowered in ('remote_web_fetch', 'web_fetch'):
+                        item = {'type': 'web_fetch', 'url': args.get('url') or '',
+                                'content': ''}
+                    else:
+                        item = {'type': 'mcp_tool', 'server': 'Kiro v3',
+                                'tool_name': name, 'arguments': args, 'response': ''}
+                    item.update(common)
+                    pending[call_id] = item
+                    self._append_item(item)
+                    self.execution_count += 1
+                elif kind == 'tool_result':
+                    call_id = str(payload.get('toolCallId') or '')
+                    result = pending.get(call_id)
+                    response = content if isinstance(content, str) else self._json_text(content)
+                    success = payload.get('success')
+                    if result is None:
+                        self._append_item({
+                            'type': 'mcp_tool', 'server': 'Kiro v3',
+                            'tool_name': 'unmatched_result', 'arguments': {},
+                            'response': response, 'execution_id': call_id or event_id})
+                        continue
+                    result['state'] = 'Success' if success is not False else 'Error'
+                    if success is False:
+                        result['error'] = response[:500]
+                    t = result.get('type')
+                    if t == 'terminal_cmd':
+                        self._append_item({'type': 'terminal_output',
+                                           'output': response, 'execution_id': call_id})
+                    elif t == 'file_read':
+                        result['output'] = response
+                    elif t == 'web_fetch':
+                        result['content'] = response
+                    elif t == 'mcp_tool':
+                        result['response'] = response
+                    elif t == 'web_search':
+                        # Render the returned search body without fabricating structured results.
+                        self._append_item({'type': 'session_event', 'event': 'web_search_result',
+                                           'content': response, 'execution_id': call_id})
+                    elif response and t not in ('file_edit', 'file_create'):
+                        self._append_item({'type': 'session_event', 'event': f'{t}_result',
+                                           'content': response, 'execution_id': call_id})
+                elif kind == 'usage_summary':
+                    self.metadata['usage_status'] = payload.get('status') or ''
+                elif kind == 'session_metadata':
+                    # The event may contain internal session state; keep diagnostics brief.
+                    name = payload.get('key') or 'metadata'
+                    self._append_item({'type': 'session_event',
+                                       'event': f'session_metadata:{name}',
+                                       'content': self._json_text(payload.get('value')),
+                                       'execution_id': event_id})
+                elif kind == 'agent_note':
+                    if isinstance(content, str) and content.strip():
+                        self._append_item({'type': 'session_event', 'event': 'agent_note',
+                                           'content': content, 'execution_id': event_id})
+                elif kind == 'pending_interaction':
+                    self._append_item({
+                        'type': 'user_input', 'question': payload.get('question') or '',
+                        'options': payload.get('options') or [],
+                        'execution_id': event_id})
+                elif kind == 'interaction_resolved':
+                    self._append_item({
+                        'type': 'session_event', 'event': 'interaction_resolved',
+                        'content': str(payload.get('selectedOption') or payload.get('outcome') or ''),
+                        'execution_id': event_id})
+                elif kind in ('turn_start', 'turn_end', 'session_start', 'session_event',
+                              'compaction'):
+                    if kind == 'compaction':
+                        self.compaction_count += 1
+                        self._append_item({
+                            'type': 'summarization', 'where': 'inline',
+                            'content': str(payload.get('summary') or content or '')})
+                    else:
+                        self._append_item({
+                            'type': 'session_event', 'event': kind,
+                            'content': str(payload.get('stopReason') or
+                                           payload.get('category') or kind),
+                            'execution_id': payload.get('executionId') or event_id})
+                else:
+                    self._append_item({'type': 'session_event', 'event': str(kind or 'unknown'),
+                                       'content': self._json_text(payload),
+                                       'execution_id': event_id})
+        self.user_turn_count = user_count
+        self.metadata['message_count'] = user_count + assistant_count
+        if user_count == 0 and assistant_count == 0 and self.title:
+            self._append_item({'type': 'user_message', 'content': self.title,
+                               'hidden': False})
+
 
     def _load_jsonl(self, jsonl_path: Path):
         prompt_count = 0
@@ -6738,14 +7037,88 @@ def interactive_loop_ide():
             process_conversion(choice, rendered_sessions)
 
 
+def open_v3_zip_archive(archive_path: Path, staging_root: Path) -> V3SessionEntry:
+    """Read one Kiro v3 archive into a temporary sandbox, never the user's store.
+
+    Accept a root-level session.json/messages.jsonl pair or the same pair
+    under one session-ID directory. Never extract archive-controlled paths.
+    """
+    if not archive_path.is_file() or not zipfile.is_zipfile(archive_path):
+        raise ValueError('Not a readable Kiro V3 zip archive')
+    with zipfile.ZipFile(archive_path, 'r') as zf:
+        infos = {info.filename.replace('\\', '/'): info
+                 for info in zf.infolist() if not info.is_dir()}
+        if len(infos) > 2000:
+            raise ValueError('Too many files in the Kiro V3 archive')
+        pairs = []
+        for name in infos:
+            if name.rsplit('/', 1)[-1] != 'session.json':
+                continue
+            parent = name.rsplit('/', 1)[0] if '/' in name else ''
+            msg_name = f'{parent}/messages.jsonl' if parent else 'messages.jsonl'
+            if msg_name in infos:
+                pairs.append((name, msg_name, parent))
+        if len(pairs) != 1:
+            raise ValueError('Kiro V3 archive must have exactly one session.json + messages.jsonl pair')
+        meta_name, msg_name, parent = pairs[0]
+        meta_info, msg_info = infos[meta_name], infos[msg_name]
+        if meta_info.file_size > 8 * 1024 * 1024 or msg_info.file_size > 512 * 1024 * 1024:
+            raise ValueError('Kiro V3 archive metadata or transcript exceeds safety limit')
+        with zf.open(meta_info) as fd:
+            meta_bytes = fd.read(8 * 1024 * 1024 + 1)
+        data = json.loads(meta_bytes)
+        sid = data.get('id') if isinstance(data, dict) else None
+        if not isinstance(sid, str) or not (
+            re.fullmatch(r'sess_[0-9a-fA-F-]{36}', sid) or
+            re.fullmatch(r'[0-9a-fA-F-]{36}', sid)):
+            raise ValueError('Kiro V3 archive has no valid session ID')
+        if not str(data.get('schemaVersion', '')).startswith('1.'):
+            raise ValueError('Unsupported Kiro V3 archive schema')
+        folder = staging_root / 'workspace' / sid
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / 'session.json').write_bytes(meta_bytes)
+        with zf.open(msg_info) as src, (folder / 'messages.jsonl').open('wb') as dst:
+            total = 0
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 512 * 1024 * 1024:
+                    raise ValueError('Kiro V3 archive exceeds decompressed size limit')
+                dst.write(chunk)
+        entry = _v3_session_from_folder(folder)
+        if entry is None:
+            raise ValueError('Kiro V3 archive is not a supported session')
+        return entry
+
+
+def interactive_loop_v3_archive():
+    """Convert a V3 /chat save archive without modifying Kiro live sessions."""
+    _clear_screen()
+    print(f"\n{Style.BOLD}KIRO V3 ARCHIVE TO MARKDOWN{Style.RESET}\n")
+    raw = input('  V3 zip archive path > ').strip().strip('"')
+    if not raw:
+        return
+    try:
+        with tempfile.TemporaryDirectory(prefix='kiro-v3-archive-') as directory:
+            entry = open_v3_zip_archive(Path(raw).expanduser(), Path(directory))
+            print(Style.success(f'Found Kiro V3 session: {entry.session_id}'))
+            process_conversion('1', [entry], parser_cls=CliSessionParser,
+                               build_execution_index=False)
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        print(Style.error(f'Archive could not be read: {exc}'))
+        input(f"\n{Style.DIM}Press Enter to continue...{Style.RESET}")
+
+
 def interactive_loop_cli():
     global EXEC_INDEX, CHAIN_GRAPH
     EXEC_INDEX = None
     CHAIN_GRAPH = None
 
-    if not KIRO_CLI_SESSIONS_DIR.exists():
-        print(Style.error(f"Kiro CLI sessions folder not found: {KIRO_CLI_SESSIONS_DIR}"))
-        print(Style.info("Set KIRO_CLI_SESSIONS_DIR env var if Kiro CLI stores sessions elsewhere."))
+    if not KIRO_CLI_SESSIONS_DIR.exists() and not KIRO_V3_SESSIONS_DIR.exists():
+        print(Style.error("Kiro CLI v2/v3 sessions directories not found."))
+        print(Style.info("Set KIRO_CLI_SESSIONS_DIR or KIRO_V3_SESSIONS_DIR to the correct location."))
         sys.exit(1)
 
     print(f"{Style.DIM}Scanning Kiro CLI sessions...{Style.RESET}")
@@ -6874,7 +7247,7 @@ def interactive_loop_cli():
 
 
 def select_session_source() -> str:
-    default_source = 'cli' if KIRO_CLI_SESSIONS_DIR.exists() else 'ide'
+    default_source = 'cli' if (KIRO_CLI_SESSIONS_DIR.exists() or KIRO_V3_SESSIONS_DIR.exists()) else 'ide'
     while True:
         _clear_screen()
         print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}choose session source{Style.RESET}\n")
@@ -6883,9 +7256,12 @@ def select_session_source() -> str:
         print(f"  {Style.YELLOW}[1]{Style.RESET} Kiro IDE sessions{ide_default}")
         print(f"      {Style.DIM}{WORKSPACE_SESSIONS_DIR}{Style.RESET}")
         print(f"  {Style.YELLOW}[2]{Style.RESET} Kiro CLI sessions{cli_default}")
-        print(f"      {Style.DIM}{KIRO_CLI_SESSIONS_DIR}{Style.RESET}")
+        print(f"      {Style.DIM}v2: {KIRO_CLI_SESSIONS_DIR}{Style.RESET}")
+        print(f"      {Style.DIM}v3: {KIRO_V3_SESSIONS_DIR}{Style.RESET}")
         print(f"  {Style.YELLOW}[3]{Style.RESET} Find by session ID")
         print(f"      {Style.DIM}Search IDE and CLI stores in parallel{Style.RESET}")
+        print(f"  {Style.YELLOW}[4]{Style.RESET} Convert Kiro v3 ZIP archive")
+        print(f"      {Style.DIM}Read /chat save backup.zip without loading it into Kiro{Style.RESET}")
         print(f"  {Style.RED}[q]{Style.RESET} Quit")
         choice = input(f"\n{Style.BOLD}Select source > {Style.RESET}").strip().lower()
         if not choice:
@@ -6896,6 +7272,8 @@ def select_session_source() -> str:
             return 'cli'
         if choice in ('3', 'f', 'find', 'id', 'session id'):
             return 'find'
+        if choice in ('4', 'zip', 'archive', 'v3 zip'):
+            return 'archive'
         if choice == 'q':
             print('Bye.'); sys.exit(0)
 
@@ -6907,6 +7285,8 @@ def interactive_loop():
             interactive_loop_cli()
         elif source == 'find':
             interactive_find_session_by_id()
+        elif source == 'archive':
+            interactive_loop_v3_archive()
         else:
             interactive_loop_ide()
 
